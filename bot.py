@@ -375,16 +375,21 @@ class FeedbackBot:
             return 0
 
 async def is_admin_or_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Check if user is owner, admin, or anonymous admin"""
+    """Check if user is owner, admin, anonymous admin, or authorized group"""
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     
     # Owner can always use commands
     if user_id == OWNER_ID:
         return True
     
+    # Check if the sender ID matches the current group ID (group sending as admin)
+    if user_id == chat_id and feedback_bot.is_group_authorized(chat_id):
+        return True
+    
     # Check if user is admin or anonymous admin
     try:
-        chat_member = await context.bot.get_chat_member(update.effective_chat.id, user_id)
+        chat_member = await context.bot.get_chat_member(chat_id, user_id)
         
         # Regular admin or creator
         if chat_member.status in ['administrator', 'creator']:
@@ -395,14 +400,13 @@ async def is_admin_or_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if hasattr(chat_member, 'is_anonymous') and chat_member.is_anonymous:
             return True
             
-        # Alternative check: anonymous admins often have user_id same as chat_id (negative)
-        if user_id == update.effective_chat.id:
-            return True
-            
         return False
         
     except Exception as e:
         logger.error(f"Error checking admin status: {e}")
+        # Fallback: if sender ID matches any authorized group ID, allow it
+        if feedback_bot.is_group_authorized(user_id):
+            return True
         return False
 
 # Initialize bot instance
