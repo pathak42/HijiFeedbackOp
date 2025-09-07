@@ -2,7 +2,7 @@ import os
 import sqlite3
 import logging
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from typing import Optional, List, Dict
 import threading
 import time
@@ -337,7 +337,7 @@ async def addreminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     reminder_text = ' '.join(context.args)
     feedback_bot.set_reminder(group_id, reminder_text)
     
-    await update.message.reply_text(f"✅ Reminder set! It will be sent every {REMINDER_INTERVAL//3600} hours.")
+    await update.message.reply_text("✅ Reminder set! It will be sent 8 times daily at: 1 AM, 4 AM, 7 AM, 10 AM, 1 PM, 4 PM, 7 PM, 10 PM UTC.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle regular messages to detect feedback"""
@@ -454,22 +454,36 @@ def main():
     application.add_handler(CommandHandler("addreminder", addreminder_command))
     application.add_handler(MessageHandler(filters.ALL, handle_message))
     
-    # Add job queue for background tasks
+    # Add job queue for background tasks (if available)
     job_queue = application.job_queue
     
-    # Schedule cleanup job to run daily
-    job_queue.run_repeating(
-        cleanup_job,
-        interval=86400,  # 24 hours
-        first=10  # Start after 10 seconds
-    )
-    
-    # Schedule reminder job
-    job_queue.run_repeating(
-        reminder_job,
-        interval=REMINDER_INTERVAL,
-        first=30  # Start after 30 seconds
-    )
+    if job_queue:
+        # Schedule cleanup job to run daily at 12 AM UTC
+        job_queue.run_daily(
+            cleanup_job,
+            time=dt_time(hour=0, minute=0, second=0)  # 12:00 AM UTC
+        )
+        
+        # Schedule reminder jobs at specific times (UTC)
+        reminder_times = [
+            dt_time(hour=1, minute=0),   # 1 AM UTC
+            dt_time(hour=4, minute=0),   # 4 AM UTC
+            dt_time(hour=7, minute=0),   # 7 AM UTC
+            dt_time(hour=10, minute=0),  # 10 AM UTC
+            dt_time(hour=13, minute=0),  # 1 PM UTC
+            dt_time(hour=16, minute=0),  # 4 PM UTC
+            dt_time(hour=19, minute=0),  # 7 PM UTC
+            dt_time(hour=22, minute=0),  # 10 PM UTC
+        ]
+        
+        for reminder_time in reminder_times:
+            job_queue.run_daily(
+                reminder_job,
+                time=reminder_time
+            )
+        logger.info("Background jobs scheduled successfully")
+    else:
+        logger.warning("JobQueue not available - background tasks disabled")
     
     # Start the bot
     logger.info("Starting Telegram Feedback Bot...")
