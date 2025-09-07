@@ -552,7 +552,6 @@ async def fb_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Owner can use this in private chat with group ID parameter
     if update.effective_chat.type == 'private':
         if update.effective_user.id == OWNER_ID:
-{{ ... }}
             if not context.args:
                 await update.message.reply_text("❌ Please provide group ID. Usage: /fb_stats -1002373349798")
                 return
