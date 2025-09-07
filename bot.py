@@ -498,7 +498,21 @@ async def removegroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not context.args:
         await update.message.reply_text("❌ Please provide group ID. Usage: /removegroup -1002373349798")
         return
-{{ ... }}
+        
+    try:
+        group_id = int(context.args[0])
+        # Try to get group info for confirmation
+        try:
+            chat = await context.bot.get_chat(group_id)
+            group_name = chat.title or "Unknown Group"
+        except Exception:
+            group_name = f"Group {group_id}"
+            
+        deleted_count = feedback_bot.remove_authorized_group(group_id)
+        
+        if deleted_count > 0:
+            await update.message.reply_text(f"✅ Group '{group_name}' (ID: {group_id}) has been removed from authorized groups!")
+        else:
             await update.message.reply_text(f"❌ Group {group_id} was not found in authorized groups.")
             
     except ValueError:
