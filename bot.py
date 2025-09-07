@@ -161,6 +161,35 @@ class FeedbackBot:
         
         return [{'message_link': row[0], 'timestamp': row[1]} for row in rows]
         
+    def get_feedback_count_stats(self, group_id: int, days: int = 3) -> Dict:
+        """Get feedback count statistics for a group"""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cutoff_date = datetime.now() - timedelta(days=days)
+        
+        # Get unique users count
+        cursor.execute('''
+            SELECT COUNT(DISTINCT user_id) as unique_users
+            FROM feedback
+            WHERE group_id = ? AND timestamp >= ?
+        ''', (group_id, cutoff_date))
+        unique_users = cursor.fetchone()[0]
+        
+        # Get total feedback count
+        cursor.execute('''
+            SELECT COUNT(*) as total_feedback
+            FROM feedback
+            WHERE group_id = ? AND timestamp >= ?
+        ''', (group_id, cutoff_date))
+        total_feedback = cursor.fetchone()[0]
+        
+        conn.close()
+        
+        return {
+            'unique_users': unique_users,
+            'total_feedback': total_feedback
+        }
+        
     def cleanup_old_feedback(self):
         """Remove feedback older than 5 days"""
         conn = sqlite3.connect(DB_NAME)
@@ -227,11 +256,29 @@ async def addgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text("❌ Only the bot owner can use this command.")
         return
-        
+    
+    # If used in private chat, expect group ID as parameter
     if update.effective_chat.type == 'private':
-        await update.message.reply_text("❌ This command can only be used in groups.")
+        if not context.args:
+            await update.message.reply_text("❌ Please provide group ID. Usage: /addgroup -1002373349798")
+            return
+            
+        try:
+            group_id = int(context.args[0])
+            # Try to get group info
+            try:
+                chat = await context.bot.get_chat(group_id)
+                group_name = chat.title or "Unknown Group"
+                feedback_bot.add_authorized_group(group_id, group_name)
+                await update.message.reply_text(f"✅ Group '{group_name}' (ID: {group_id}) has been authorized to use the feedback bot!")
+            except Exception as e:
+                await update.message.reply_text(f"❌ Could not access group {group_id}. Make sure the bot is added to the group and the ID is correct.")
+                logger.error(f"Error accessing group {group_id}: {e}")
+        except ValueError:
+            await update.message.reply_text("❌ Invalid group ID format. Usage: /addgroup -1002373349798")
         return
         
+    # If used in group chat (original functionality)
     group_id = update.effective_chat.id
     group_name = update.effective_chat.title or "Unknown Group"
     
@@ -239,12 +286,29 @@ async def addgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Group '{group_name}' has been authorized to use the feedback bot!")
 
 async def fb_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /fb_stats command"""
+    """Handle /fb_stats command - Admins only"""
+    # Owner can use this in private chat with group ID parameter
     if update.effective_chat.type == 'private':
-        await update.message.reply_text("❌ This command can only be used in groups.")
-        return
-        
-    group_id = update.effective_chat.id
+        if update.effective_user.id == OWNER_ID:
+            if not context.args:
+                await update.message.reply_text("❌ Please provide group ID. Usage: /fb_stats -1002373349798")
+                return
+            try:
+                group_id = int(context.args[0])
+            except ValueError:
+                await update.message.reply_text("❌ Invalid group ID format.")
+                return
+        else:
+            await update.message.reply_text("❌ This command can only be used in groups.")
+            return
+    else:
+        # Check if user is admin or owner
+        if update.effective_user.id != OWNER_ID:
+            chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
+            if chat_member.status not in ['administrator', 'creator']:
+                await update.message.reply_text("❌ Only group administrators can use this command.")
+                return
+        group_id = update.effective_chat.id
     
     if not feedback_bot.is_group_authorized(group_id):
         await update.message.reply_text("❌ This group is not authorized. Ask the owner to run /addgroup first.")
@@ -272,25 +336,50 @@ async def check_user_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if update.effective_chat.type == 'private':
         return
         
-    if not update.message.reply_to_message:
-        return
-        
-    # Check if user is admin
-    chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
-    if chat_member.status not in ['administrator', 'creator']:
-        await update.message.reply_text("❌ Only group administrators can use this command.")
-        return
+    # Check if user is admin or owner
+    if update.effective_user.id != OWNER_ID:
+        chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
+        if chat_member.status not in ['administrator', 'creator']:
+            await update.message.reply_text("❌ Only group administrators can use this command.")
+            return
         
     group_id = update.effective_chat.id
     
     if not feedback_bot.is_group_authorized(group_id):
         return
+    
+    target_user = None
+    
+    # Check if it's a reply to a message
+    if update.message.reply_to_message:
+        target_user = update.message.reply_to_message.from_user
+    # Check if there's a mention in the command
+    elif update.message.entities:
+        for entity in update.message.entities:
+            if entity.type == "mention":
+                # Extract username from @mention
+                username = update.message.text[entity.offset+1:entity.offset+entity.length]
+                try:
+                    # Try to get user info by username
+                    chat_member = await context.bot.get_chat_member(group_id, f"@{username}")
+                    target_user = chat_member.user
+                    break
+                except Exception as e:
+                    logger.error(f"Could not find user @{username}: {e}")
+                    continue
+            elif entity.type == "text_mention":
+                target_user = entity.user
+                break
+    
+    if not target_user:
+        await update.message.reply_text("❌ Please reply to a user's message or mention a user with /check @username")
+        return
         
-    target_user = update.message.reply_to_message.from_user
     user_feedback = feedback_bot.get_user_feedback(target_user.id, group_id, 3)
     
     if not user_feedback:
-        await update.message.reply_text("❌ No feedback was received from him in the last 3 days")
+        username = target_user.username or target_user.full_name or f"User {target_user.id}"
+        await update.message.reply_text(f"❌ No feedback was received from {username} in the last 3 days")
         return
         
     username = target_user.username or target_user.full_name or f"User {target_user.id}"
@@ -338,6 +427,67 @@ async def addreminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     feedback_bot.set_reminder(group_id, reminder_text)
     
     await update.message.reply_text("✅ Reminder set! It will be sent 8 times daily at: 1 AM, 4 AM, 7 AM, 10 AM, 1 PM, 4 PM, 7 PM, 10 PM UTC.")
+
+async def fbcount_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /fbcount command - Admins only"""
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text("❌ This command can only be used in groups.")
+        return
+        
+    # Check if user is admin or owner
+    if update.effective_user.id != OWNER_ID:
+        chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
+        if chat_member.status not in ['administrator', 'creator']:
+            await update.message.reply_text("❌ Only group administrators can use this command.")
+            return
+        
+    group_id = update.effective_chat.id
+    
+    if not feedback_bot.is_group_authorized(group_id):
+        await update.message.reply_text("❌ This group is not authorized. Ask the owner to run /addgroup first.")
+        return
+        
+    stats = feedback_bot.get_feedback_count_stats(group_id, 3)
+    
+    message = f"📊 **Feedback Count (Last 3 Days):**\n\n"
+    message += f"👥 **Unique Members:** {stats['unique_users']}\n"
+    message += f"📝 **Total Feedback:** {stats['total_feedback']}\n"
+    
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+async def fbcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /fbcommands command - Admins only"""
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text("❌ This command can only be used in groups.")
+        return
+        
+    # Check if user is admin or owner
+    if update.effective_user.id != OWNER_ID:
+        chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
+        if chat_member.status not in ['administrator', 'creator']:
+            await update.message.reply_text("❌ Only group administrators can use this command.")
+            return
+    
+    message = "🤖 **Bot Commands:**\n\n"
+    message += "**For Everyone:**\n"
+    message += "• `/start` - Welcome message\n\n"
+    
+    message += "**For Admins:**\n"
+    message += "• `/fb_stats` - Show feedback from last 3 days\n"
+    message += "• `/check @user` - Check user's feedback (reply or mention)\n"
+    message += "• `/fbcount` - Show feedback statistics\n"
+    message += "• `/fbcommands` - Show this commands list\n"
+    message += "• `/addreminder <text>` - Set periodic reminders\n\n"
+    
+    message += "**For Owner:**\n"
+    message += "• `/addgroup` - Authorize group (in group or DM with ID)\n"
+    message += "• `/cleardb` - Clear all feedback data\n\n"
+    
+    message += "**Feedback Submission:**\n"
+    message += "• Send `#feedback` with media (photo/video/document)\n"
+    message += "• Reply to media with `#feedback`"
+    
+    await update.message.reply_text(message, parse_mode='Markdown')
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle regular messages to detect feedback"""
@@ -452,6 +602,8 @@ def main():
     application.add_handler(CommandHandler("check", check_user_feedback))
     application.add_handler(CommandHandler("cleardb", cleardb_command))
     application.add_handler(CommandHandler("addreminder", addreminder_command))
+    application.add_handler(CommandHandler("fbcount", fbcount_command))
+    application.add_handler(CommandHandler("fbcommands", fbcommands_command))
     application.add_handler(MessageHandler(filters.ALL, handle_message))
     
     # Add job queue for background tasks (if available)
