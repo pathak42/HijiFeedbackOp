@@ -34,6 +34,7 @@ class FeedbackBot:
         self.app = None
         self.authorized_groups = set()
         self.group_reminders = {}
+        self.media_groups = {}  # Track media groups: {media_group_id: {'messages': [], 'has_feedback': False, 'user_id': int, 'group_id': int}}
         self.init_database()
         self.load_authorized_groups()
         
@@ -53,7 +54,8 @@ class FeedbackBot:
                 group_name TEXT,
                 message_link TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                message_id INTEGER
+                message_id INTEGER,
+                media_count INTEGER DEFAULT 1
             )
         ''')
         
@@ -72,6 +74,20 @@ class FeedbackBot:
                 group_id INTEGER PRIMARY KEY,
                 reminder_text TEXT,
                 added_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Daily feedback contest table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS daily_feedback_contest (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                display_name TEXT,
+                group_id INTEGER NOT NULL,
+                contest_date DATE NOT NULL,
+                feedback_count INTEGER DEFAULT 0,
+                UNIQUE(user_id, group_id, contest_date)
             )
         ''')
         
@@ -99,20 +115,32 @@ class FeedbackBot:
         conn.close()
         self.authorized_groups.add(group_id)
         
+    def remove_authorized_group(self, group_id: int):
+        """Remove a group from authorized groups"""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM authorized_groups WHERE group_id = ?', (group_id,))
+        deleted_count = cursor.rowcount
+        conn.commit()
+        conn.close()
+        self.authorized_groups.discard(group_id)
+        return deleted_count
+        
     def is_group_authorized(self, group_id: int) -> bool:
         """Check if a group is authorized"""
         return group_id in self.authorized_groups
         
     def add_feedback(self, user_id: int, username: str, display_name: str, 
-                    group_id: int, group_name: str, message_link: str, message_id: int):
-        """Add feedback entry to database"""
+                    group_id: int, group_name: str, message_link: str, message_id: int, media_count: int = 1):
+        """Add feedback to database"""
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
+        
         cursor.execute('''
-            INSERT INTO feedback (user_id, username, display_name, group_id, 
-                                group_name, message_link, message_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (user_id, username, display_name, group_id, group_name, message_link, message_id))
+            INSERT INTO feedback (user_id, username, display_name, group_id, group_name, message_link, message_id, media_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (user_id, username, display_name, group_id, group_name, message_link, message_id, media_count))
+        
         conn.commit()
         conn.close()
         
@@ -123,7 +151,7 @@ class FeedbackBot:
         cutoff_date = datetime.now() - timedelta(days=days)
         
         cursor.execute('''
-            SELECT user_id, username, display_name, message_link, timestamp
+            SELECT user_id, username, display_name, message_link, timestamp, media_count
             FROM feedback
             WHERE group_id = ? AND timestamp >= ?
             ORDER BY timestamp DESC
@@ -138,7 +166,8 @@ class FeedbackBot:
                 'username': row[1],
                 'display_name': row[2],
                 'message_link': row[3],
-                'timestamp': row[4]
+                'timestamp': row[4],
+                'media_count': row[5]
             }
             for row in rows
         ]
@@ -150,7 +179,7 @@ class FeedbackBot:
         cutoff_date = datetime.now() - timedelta(days=days)
         
         cursor.execute('''
-            SELECT message_link, timestamp
+            SELECT message_link, timestamp, media_count
             FROM feedback
             WHERE user_id = ? AND group_id = ? AND timestamp >= ?
             ORDER BY timestamp DESC
@@ -159,7 +188,7 @@ class FeedbackBot:
         rows = cursor.fetchall()
         conn.close()
         
-        return [{'message_link': row[0], 'timestamp': row[1]} for row in rows]
+        return [{'message_link': row[0], 'timestamp': row[1], 'media_count': row[2]} for row in rows]
         
     def get_feedback_count_stats(self, group_id: int, days: int = 3) -> Dict:
         """Get feedback count statistics for a group"""
@@ -175,9 +204,9 @@ class FeedbackBot:
         ''', (group_id, cutoff_date))
         unique_users = cursor.fetchone()[0]
         
-        # Get total feedback count
+        # Get total feedback count (sum of media_count)
         cursor.execute('''
-            SELECT COUNT(*) as total_feedback
+            SELECT COALESCE(SUM(media_count), 0) as total_feedback
             FROM feedback
             WHERE group_id = ? AND timestamp >= ?
         ''', (group_id, cutoff_date))
@@ -243,6 +272,107 @@ class FeedbackBot:
             self.group_reminders[group_id] = row[0]
             return row[0]
         return None
+        
+    def get_contest_date(self, timestamp=None):
+        """Get contest date based on custom day (2PM UTC to 1:59PM UTC next day)"""
+        if timestamp is None:
+            timestamp = datetime.now()
+        
+        # If time is before 2PM UTC, it belongs to previous contest day
+        if timestamp.hour < 14:  # Before 2PM UTC
+            contest_date = (timestamp - timedelta(days=1)).date()
+        else:  # 2PM UTC or later
+            contest_date = timestamp.date()
+            
+        return contest_date
+        
+    def add_contest_feedback(self, user_id: int, username: str, display_name: str, 
+                           group_id: int, feedback_count: int = 1):
+        """Add or update daily contest feedback count"""
+        contest_date = self.get_contest_date()
+        
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        
+        # Insert or update feedback count
+        cursor.execute('''
+            INSERT INTO daily_feedback_contest 
+            (user_id, username, display_name, group_id, contest_date, feedback_count)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, group_id, contest_date) 
+            DO UPDATE SET 
+                feedback_count = feedback_count + ?,
+                username = ?,
+                display_name = ?
+        ''', (user_id, username, display_name, group_id, contest_date, feedback_count,
+              feedback_count, username, display_name))
+        
+        conn.commit()
+        conn.close()
+        
+    def get_daily_contest_winners(self, group_id: int, contest_date=None):
+        """Get winner and runner-up for a specific contest date"""
+        if contest_date is None:
+            contest_date = self.get_contest_date()
+            
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT user_id, username, display_name, feedback_count
+            FROM daily_feedback_contest
+            WHERE group_id = ? AND contest_date = ?
+            ORDER BY feedback_count DESC, user_id ASC
+            LIMIT 2
+        ''', (group_id, contest_date))
+        
+        results = cursor.fetchall()
+        conn.close()
+        
+        winner = None
+        runner_up = None
+        
+        if len(results) >= 1:
+            winner = {
+                'user_id': results[0][0],
+                'username': results[0][1],
+                'display_name': results[0][2],
+                'feedback_count': results[0][3]
+            }
+            
+        if len(results) >= 2 and results[1][3] > 0:  # Runner-up must have at least 1 feedback
+            runner_up = {
+                'user_id': results[1][0],
+                'username': results[1][1],
+                'display_name': results[1][2],
+                'feedback_count': results[1][3]
+            }
+            
+        return winner, runner_up
+        
+    def process_media_group(self, media_group_id: str, user_id: int, username: str, 
+                          display_name: str, group_id: int):
+        """Process completed media group and count all items if #feedback found"""
+        if media_group_id not in self.media_groups:
+            return 0
+            
+        media_group_data = self.media_groups[media_group_id]
+        
+        # If #feedback was found in any message of the group, count all messages
+        if media_group_data['has_feedback']:
+            media_count = len(media_group_data['messages'])
+            
+            # Add to contest with the total count
+            self.add_contest_feedback(user_id, username, display_name, group_id, media_count)
+            
+            # Clean up the media group data
+            del self.media_groups[media_group_id]
+            
+            return media_count
+        else:
+            # Clean up if no feedback found
+            del self.media_groups[media_group_id]
+            return 0
 
 # Initialize bot instance
 feedback_bot = FeedbackBot()
@@ -284,6 +414,40 @@ async def addgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     feedback_bot.add_authorized_group(group_id, group_name)
     await update.message.reply_text(f"✅ Group '{group_name}' has been authorized to use the feedback bot!")
+
+async def removegroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /removegroup command - Owner only"""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Only the bot owner can use this command.")
+        return
+    
+    # Only works in private chat
+    if update.effective_chat.type != 'private':
+        await update.message.reply_text("❌ This command can only be used in bot's private messages.")
+        return
+        
+    if not context.args:
+        await update.message.reply_text("❌ Please provide group ID. Usage: /removegroup -1002373349798")
+        return
+        
+    try:
+        group_id = int(context.args[0])
+        # Try to get group info for confirmation
+        try:
+            chat = await context.bot.get_chat(group_id)
+            group_name = chat.title or "Unknown Group"
+        except Exception:
+            group_name = f"Group {group_id}"
+            
+        deleted_count = feedback_bot.remove_authorized_group(group_id)
+        
+        if deleted_count > 0:
+            await update.message.reply_text(f"✅ Group '{group_name}' (ID: {group_id}) has been removed from authorized groups!")
+        else:
+            await update.message.reply_text(f"❌ Group {group_id} was not found in authorized groups.")
+            
+    except ValueError:
+        await update.message.reply_text("❌ Invalid group ID format. Usage: /removegroup -1002373349798")
 
 async def fb_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /fb_stats command - Admins only"""
@@ -403,30 +567,50 @@ async def cleardb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def addreminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /addreminder command - Admins only"""
+    # Owner can use this in private chat with group ID parameter
     if update.effective_chat.type == 'private':
-        await update.message.reply_text("❌ This command can only be used in groups.")
-        return
+        if update.effective_user.id == OWNER_ID:
+            if len(context.args) < 2:
+                await update.message.reply_text("❌ Please provide group ID and reminder text. Usage: /addreminder -1002373349798 Your reminder text here")
+                return
+            try:
+                group_id = int(context.args[0])
+                reminder_text = ' '.join(context.args[1:])
+            except ValueError:
+                await update.message.reply_text("❌ Invalid group ID format. Usage: /addreminder -1002373349798 Your reminder text here")
+                return
+        else:
+            await update.message.reply_text("❌ This command can only be used in groups.")
+            return
+    else:
+        # Check if user is admin or owner
+        if update.effective_user.id != OWNER_ID:
+            chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
+            if chat_member.status not in ['administrator', 'creator']:
+                await update.message.reply_text("❌ Only group administrators can use this command.")
+                return
         
-    # Check if user is admin
-    chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
-    if chat_member.status not in ['administrator', 'creator']:
-        await update.message.reply_text("❌ Only group administrators can use this command.")
-        return
+        group_id = update.effective_chat.id
         
-    group_id = update.effective_chat.id
+        if not context.args:
+            await update.message.reply_text("❌ Please provide reminder text. Usage: /addreminder <text>")
+            return
+            
+        reminder_text = ' '.join(context.args)
     
     if not feedback_bot.is_group_authorized(group_id):
         await update.message.reply_text("❌ This group is not authorized. Ask the owner to run /addgroup first.")
         return
         
-    if not context.args:
-        await update.message.reply_text("❌ Please provide reminder text. Usage: /addreminder <text>")
-        return
-        
-    reminder_text = ' '.join(context.args)
     feedback_bot.set_reminder(group_id, reminder_text)
     
-    await update.message.reply_text("✅ Reminder set! It will be sent 8 times daily at: 1 AM, 4 AM, 7 AM, 10 AM, 1 PM, 4 PM, 7 PM, 10 PM UTC.")
+    # Get group name for confirmation
+    try:
+        chat = await context.bot.get_chat(group_id)
+        group_name = chat.title or "Unknown Group"
+        await update.message.reply_text(f"✅ Reminder set for '{group_name}'! It will be sent 8 times daily at: 1 AM, 4 AM, 7 AM, 10 AM, 1 PM, 4 PM, 7 PM, 10 PM UTC.")
+    except Exception:
+        await update.message.reply_text("✅ Reminder set! It will be sent 8 times daily at: 1 AM, 4 AM, 7 AM, 10 AM, 1 PM, 4 PM, 7 PM, 10 PM UTC.")
 
 async def fbcount_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /fbcount command - Admins only"""
@@ -481,6 +665,8 @@ async def fbcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     message += "**For Owner:**\n"
     message += "• `/addgroup` - Authorize group (in group or DM with ID)\n"
+    message += "• `/removegroup` - Remove group authorization (DM only)\n"
+    message += "• `/addreminder` - Set reminders (in group or DM with ID)\n"
     message += "• `/cleardb` - Clear all feedback data\n\n"
     
     message += "**Feedback Submission:**\n"
@@ -502,39 +688,224 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     text = message.text or message.caption or ""
     
-    # Check if message contains #feedback
-    if '#feedback' not in text.lower():
-        return
-        
-    # Check if message has media or is a reply to media with #feedback
+    # Check if message has media or is a reply to media
     has_media = bool(message.photo or message.video or message.document or message.animation)
     is_reply_to_media = False
+    reply_from_same_user = False
     
     if message.reply_to_message:
         reply_msg = message.reply_to_message
         is_reply_to_media = bool(reply_msg.photo or reply_msg.video or reply_msg.document or reply_msg.animation)
+        # Check if the person replying is the same as who sent the original media
+        reply_from_same_user = (message.from_user.id == reply_msg.from_user.id)
         
-    if not (has_media or is_reply_to_media):
+    # Only process if:
+    # 1. Message has media with #feedback, OR
+    # 2. Reply to media with #feedback from the SAME user who sent the media
+    if not (has_media or (is_reply_to_media and reply_from_same_user)):
         return
-        
-    # Create message link
-    if update.effective_chat.username:
-        message_link = f"https://t.me/{update.effective_chat.username}/{message.message_id}"
-    else:
-        # For private groups, create a different format
-        message_link = f"https://t.me/c/{str(group_id)[4:]}/{message.message_id}"
         
     user = message.from_user
     username = user.username
     display_name = user.full_name
     group_name = update.effective_chat.title or "Unknown Group"
     
+    # Handle media groups
+    if message.media_group_id:
+        media_group_id = message.media_group_id
+        
+        # Initialize media group tracking if not exists
+        if media_group_id not in feedback_bot.media_groups:
+            feedback_bot.media_groups[media_group_id] = {
+                'messages': [],
+                'has_feedback': False,
+                'user_id': user.id,
+                'username': username,
+                'display_name': display_name,
+                'group_id': group_id,
+                'group_name': group_name
+            }
+        
+        # Add this message to the media group
+        feedback_bot.media_groups[media_group_id]['messages'].append({
+            'message_id': message.message_id,
+            'text': text,
+            'has_media': has_media
+        })
+        
+        # Check if this message contains #feedback
+        if '#feedback' in text.lower():
+            feedback_bot.media_groups[media_group_id]['has_feedback'] = True
+            
+        # Schedule processing of media group after a delay (to collect all messages)
+        context.job_queue.run_once(
+            lambda context: process_media_group_delayed(context, media_group_id),
+            when=2.0  # 2 seconds delay
+        )
+        
+    else:
+        # Handle single media message or reply to media
+        if '#feedback' in text.lower():
+            # Determine if this is a reply to media from same user
+            if is_reply_to_media and reply_from_same_user:
+                # Handle reply to media (possibly media group)
+                reply_msg = message.reply_to_message
+                
+                if reply_msg.media_group_id:
+                    # Reply to media group - need to count all items in that group
+                    await handle_reply_to_media_group(update, context, reply_msg)
+                else:
+                    # Reply to single media
+                    await handle_reply_to_single_media(update, context, reply_msg)
+            
+            elif has_media:
+                # Direct media with #feedback
+                # Create message link
+                if update.effective_chat.username:
+                    message_link = f"https://t.me/{update.effective_chat.username}/{message.message_id}"
+                else:
+                    message_link = f"https://t.me/c/{str(group_id)[4:]}/{message.message_id}"
+                
+                feedback_bot.add_feedback(
+                    user.id, username, display_name, group_id, 
+                    group_name, message_link, message.message_id, 1
+                )
+                
+                # Add to daily contest (single item)
+                feedback_bot.add_contest_feedback(
+                    user.id, username, display_name, group_id, 1
+                )
+                
+                # Send confirmation message
+                member_name = display_name or username or f"User {user.id}"
+                await update.message.reply_text(f"Feedback received, Thank you {member_name}.")
+                
+                logger.info(f"Feedback logged from {username} in {group_name} (single media)")
+
+async def handle_reply_to_single_media(update: Update, context: ContextTypes.DEFAULT_TYPE, reply_msg):
+    """Handle #feedback reply to a single media message"""
+    group_id = update.effective_chat.id
+    user = update.message.from_user
+    username = user.username
+    display_name = user.full_name
+    group_name = update.effective_chat.title or "Unknown Group"
+    
+    # Create message link to the original media
+    if update.effective_chat.username:
+        message_link = f"https://t.me/{update.effective_chat.username}/{reply_msg.message_id}"
+    else:
+        message_link = f"https://t.me/c/{str(group_id)[4:]}/{reply_msg.message_id}"
+    
     feedback_bot.add_feedback(
         user.id, username, display_name, group_id, 
-        group_name, message_link, message.message_id
+        group_name, message_link, reply_msg.message_id, 1
     )
     
-    logger.info(f"Feedback logged from {username} in {group_name}")
+    # Add to daily contest (single item)
+    feedback_bot.add_contest_feedback(
+        user.id, username, display_name, group_id, 1
+    )
+    
+    # Send confirmation message
+    member_name = display_name or username or f"User {user.id}"
+    await update.message.reply_text(f"Feedback received, Thank you {member_name}.")
+    
+    logger.info(f"Feedback logged from {username} in {group_name} (reply to single media)")
+
+async def handle_reply_to_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE, reply_msg):
+    """Handle #feedback reply to a media group - count all items in the group"""
+    group_id = update.effective_chat.id
+    user = update.message.from_user
+    username = user.username
+    display_name = user.full_name
+    group_name = update.effective_chat.title or "Unknown Group"
+    
+    # For media group replies, we need to estimate the group size
+    # Since we can't easily get all messages in a media group retroactively,
+    # we'll use a heuristic approach or store media group info when first seen
+    
+    # Create message link to the replied media (part of the group)
+    if update.effective_chat.username:
+        message_link = f"https://t.me/{update.effective_chat.username}/{reply_msg.message_id}"
+    else:
+        message_link = f"https://t.me/c/{str(group_id)[4:]}/{reply_msg.message_id}"
+    
+    # For now, we'll count it as 1 item since we can't retroactively count the full group
+    # In a production system, you might want to store media group info when first received
+    media_count = 1
+    
+    feedback_bot.add_feedback(
+        user.id, username, display_name, group_id, 
+        group_name, message_link, reply_msg.message_id, media_count
+    )
+    
+    # Add to daily contest
+    feedback_bot.add_contest_feedback(
+        user.id, username, display_name, group_id, media_count
+    )
+    
+    # Send confirmation message
+    member_name = display_name or username or f"User {user.id}"
+    await update.message.reply_text(f"Feedback received, Thank you {member_name}. (Reply to media group)")
+    
+    logger.info(f"Feedback logged from {username} in {group_name} (reply to media group)")
+
+async def process_media_group_delayed(context, media_group_id):
+    """Process media group after delay to ensure all messages are collected"""
+    if media_group_id not in feedback_bot.media_groups:
+        return
+        
+    media_group_data = feedback_bot.media_groups[media_group_id]
+    
+    if media_group_data['has_feedback']:
+        # Count all media items in the group
+        media_count = len(media_group_data['messages'])
+        
+        # Add feedback entry (use first message for link)
+        first_message = media_group_data['messages'][0]
+        group_id = media_group_data['group_id']
+        
+        if context.bot_data.get('chat_username'):
+            message_link = f"https://t.me/{context.bot_data['chat_username']}/{first_message['message_id']}"
+        else:
+            message_link = f"https://t.me/c/{str(group_id)[4:]}/{first_message['message_id']}"
+            
+        feedback_bot.add_feedback(
+            media_group_data['user_id'], 
+            media_group_data['username'], 
+            media_group_data['display_name'], 
+            group_id,
+            media_group_data['group_name'], 
+            message_link, 
+            first_message['message_id'],
+            media_count
+        )
+        
+        # Add to contest with full media count
+        feedback_bot.add_contest_feedback(
+            media_group_data['user_id'],
+            media_group_data['username'],
+            media_group_data['display_name'],
+            group_id,
+            media_count
+        )
+        
+        # Send confirmation message
+        member_name = media_group_data['display_name'] or media_group_data['username'] or f"User {media_group_data['user_id']}"
+        
+        try:
+            await context.bot.send_message(
+                chat_id=group_id,
+                text=f"Feedback received, Thank you {member_name}. ({media_count} items counted)"
+            )
+        except Exception as e:
+            logger.error(f"Failed to send confirmation for media group: {e}")
+            
+        logger.info(f"Media group feedback logged from {media_group_data['username']} in {media_group_data['group_name']} (count: {media_count})")
+    
+    # Clean up media group data
+    if media_group_id in feedback_bot.media_groups:
+        del feedback_bot.media_groups[media_group_id]
 
 def create_flask_app():
     """Create Flask app for keep-alive"""
@@ -578,6 +949,53 @@ async def reminder_job(context):
     except Exception as e:
         logger.error(f"Error in reminder job: {e}")
 
+async def contest_announcement_job(context):
+    """Daily contest winner announcement job"""
+    try:
+        # Get previous contest date (since we announce at 2:30PM for the day that ended at 2PM)
+        current_time = datetime.now()
+        if current_time.hour >= 14:  # After 2PM UTC
+            contest_date = current_time.date()
+        else:  # Before 2PM UTC
+            contest_date = (current_time - timedelta(days=1)).date()
+            
+        # Announce winners for all authorized groups
+        for group_id in feedback_bot.authorized_groups:
+            try:
+                winner, runner_up = feedback_bot.get_daily_contest_winners(group_id, contest_date)
+                
+                if winner and winner['feedback_count'] > 0:
+                    message = "🏆 **Daily Feedback Contest Results** 🏆\n\n"
+                    
+                    # Winner
+                    winner_name = winner['display_name'] or "Unknown"
+                    winner_username = f"@{winner['username']}" if winner['username'] else ""
+                    message += f"**Winner of the Feedback Contest**\n"
+                    message += f"{winner_name} {winner_username} `{winner['user_id']}`\n"
+                    message += f"Total feedbacks sent today: **{winner['feedback_count']}**\n\n"
+                    
+                    # Runner-up
+                    if runner_up and runner_up['feedback_count'] > 0:
+                        runner_name = runner_up['display_name'] or "Unknown"
+                        runner_username = f"@{runner_up['username']}" if runner_up['username'] else ""
+                        message += f"**Runner-up of the Feedback Contest**\n"
+                        message += f"{runner_name} {runner_username} `{runner_up['user_id']}`\n"
+                        message += f"Total feedbacks sent today: **{runner_up['feedback_count']}**\n\n"
+                    
+                    message += "🎉 Congratulations to our feedback champions!"
+                    
+                    await context.bot.send_message(
+                        chat_id=group_id,
+                        text=message,
+                        parse_mode='Markdown'
+                    )
+                    
+            except TelegramError as e:
+                logger.error(f"Failed to send contest announcement to group {group_id}: {e}")
+                
+    except Exception as e:
+        logger.error(f"Error in contest announcement job: {e}")
+
 def main():
     """Main function to run the bot"""
     if not BOT_TOKEN:
@@ -598,6 +1016,7 @@ def main():
     # Add handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("addgroup", addgroup_command))
+    application.add_handler(CommandHandler("removegroup", removegroup_command))
     application.add_handler(CommandHandler("fb_stats", fb_stats_command))
     application.add_handler(CommandHandler("check", check_user_feedback))
     application.add_handler(CommandHandler("cleardb", cleardb_command))
@@ -633,6 +1052,13 @@ def main():
                 reminder_job,
                 time=reminder_time
             )
+            
+        # Schedule contest announcement at 2:30 PM UTC daily
+        job_queue.run_daily(
+            contest_announcement_job,
+            time=dt_time(hour=14, minute=30, second=0)  # 2:30 PM UTC
+        )
+        
         logger.info("Background jobs scheduled successfully")
     else:
         logger.warning("JobQueue not available - background tasks disabled")
