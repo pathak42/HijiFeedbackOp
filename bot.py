@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, time as dt_time
 from typing import Optional, List, Dict
 import threading
 import time
+import io
 
 from telegram import Update, Message
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -13,10 +14,15 @@ from telegram.error import TelegramError
 import flask
 from flask import Flask
 
-# Configure logging
+# Configure logging with file handler
+log_filename = 'bot.log'
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler(log_filename),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -25,6 +31,9 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 OWNER_ID = int(os.getenv('OWNER_ID', '0'))
 REMINDER_INTERVAL = int(os.getenv('REMINDER_INTERVAL', '7200'))  # 2 hours in seconds
 PORT = int(os.getenv('PORT', '8080'))
+
+# Hardcoded admin usernames (always treated as admins)
+HARDCODED_ADMINS = {"GroupAnonymousBot"}
 
 # Database setup
 DB_NAME = 'feedback_bot.db'
@@ -35,6 +44,7 @@ class FeedbackBot:
         self.authorized_groups = set()
         self.group_reminders = {}
         self.media_groups = {}  # Track media groups: {media_group_id: {'messages': [], 'has_feedback': False, 'user_id': int, 'group_id': int}}
+        self.forwarding_group_id = None  # In-memory storage for forwarding group
         self.init_database()
         self.load_authorized_groups()
         
@@ -67,6 +77,15 @@ class FeedbackBot:
                 added_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        
+        # Authorized users table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS authorized_users (
+                user_id INTEGER PRIMARY KEY,
+                added_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
         
         # Reminders table
         cursor.execute('''
@@ -374,16 +393,22 @@ class FeedbackBot:
         conn.commit()
         conn.close()
         
-    def is_user_authorized(self, user_id: int) -> bool:
+    def is_user_authorized(self, user_id):
         """Check if user is manually authorized"""
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
-        
-        cursor.execute('SELECT user_id FROM authorized_users WHERE user_id = ?', (user_id,))
+        cursor.execute('SELECT 1 FROM authorized_users WHERE user_id = ?', (user_id,))
         result = cursor.fetchone()
         conn.close()
-        
         return result is not None
+    
+    def set_forwarding_group(self, group_id):
+        """Set the group ID for feedback forwarding"""
+        self.forwarding_group_id = group_id
+    
+    def get_forwarding_group(self):
+        """Get the current forwarding group ID"""
+        return self.forwarding_group_id
         
     def process_media_group(self, media_group_id: str, user_id: int, username: str, 
                           display_name: str, group_id: int):
@@ -413,6 +438,7 @@ async def is_admin_or_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """Check if user is owner, admin, anonymous admin, or manually authorized"""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
+    username = update.effective_user.username
     
     # Owner can always use commands
     if user_id == OWNER_ID:
@@ -422,13 +448,23 @@ async def is_admin_or_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if feedback_bot.is_user_authorized(user_id):
         return True
     
+    # Check if user is in hardcoded admin list (always treated as admin)
+    if username in HARDCODED_ADMINS:
+        logger.info(f"Hardcoded admin detected: {username} - granting admin access")
+        return True
+    
     # Debug logging
-    logger.info(f"Checking admin status for user_id: {user_id}, chat_id: {chat_id}")
+    logger.info(f"Checking admin status for user_id: {user_id}, username: {username}, chat_id: {chat_id}")
     
     # Check if user is admin or anonymous admin
     try:
         chat_member = await context.bot.get_chat_member(chat_id, user_id)
         logger.info(f"Chat member status: {chat_member.status}, is_anonymous: {getattr(chat_member, 'is_anonymous', False)}")
+        
+        # Check if user is in hardcoded admin list via chat_member (double check)
+        if hasattr(chat_member.user, 'username') and chat_member.user.username in HARDCODED_ADMINS:
+            logger.info(f"Hardcoded admin confirmed via chat_member: {chat_member.user.username} - granting admin access")
+            return True
         
         # Regular admin or creator
         if chat_member.status in ['administrator', 'creator']:
@@ -446,6 +482,10 @@ async def is_admin_or_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         
     except Exception as e:
         logger.error(f"Error checking admin status for user {user_id}: {e}")
+        # If there's an error and it's a hardcoded admin, still allow
+        if username in HARDCODED_ADMINS:
+            logger.info(f"Error occurred but user is hardcoded admin: {username} - granting admin access")
+            return True
         return False
 
 # Initialize bot instance
@@ -547,6 +587,75 @@ async def addauth_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ Invalid user ID format. Usage: /addauth 123456789")
 
+async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /logs command - Owner only (send log file)"""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Only the bot owner can use this command.")
+        return
+        
+    if update.effective_chat.type != 'private':
+        await update.message.reply_text("❌ This command can only be used in private chat.")
+        return
+        
+    try:
+        # Check if log file exists
+        if not os.path.exists(log_filename):
+            await update.message.reply_text("❌ Log file not found.")
+            return
+            
+        # Get file size
+        file_size = os.path.getsize(log_filename)
+        
+        # Telegram file size limit is 50MB
+        if file_size > 50 * 1024 * 1024:
+            await update.message.reply_text("❌ Log file is too large (>50MB). Please check server logs directly.")
+            return
+            
+        # Send the log file
+        with open(log_filename, 'rb') as log_file:
+            await update.message.reply_document(
+                document=log_file,
+                filename=f"bot_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                caption="📋 Bot Log File"
+            )
+            
+    except Exception as e:
+        logger.error(f"Error sending log file: {e}")
+        await update.message.reply_text(f"❌ Error sending log file: {str(e)}")
+
+async def addplace_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /addplace command - Owner only (set feedback forwarding group) - DM only"""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Only the bot owner can use this command.")
+        return
+        
+    if update.effective_chat.type != 'private':
+        await update.message.reply_text("❌ This command can only be used in private chat.")
+        return
+        
+    if not context.args:
+        await update.message.reply_text("❌ Please provide group ID. Usage: /addplace -1002373349798")
+        return
+        
+    try:
+        group_id = int(context.args[0])
+        
+        # Try to get group info to verify the bot has access
+        try:
+            chat = await context.bot.get_chat(group_id)
+            group_name = chat.title or f"Group {group_id}"
+            
+            # Set the forwarding group
+            feedback_bot.set_forwarding_group(group_id)
+            await update.message.reply_text(f"✅ Feedback forwarding set to '{group_name}' (ID: {group_id})")
+            
+        except Exception as e:
+            await update.message.reply_text(f"❌ Could not access group {group_id}. Make sure the bot is added to the group and the ID is correct.")
+            logger.error(f"Error accessing forwarding group {group_id}: {e}")
+            
+    except ValueError:
+        await update.message.reply_text("❌ Invalid group ID format. Usage: /addplace -1002373349798")
+
 async def fb_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /fb_stats command - Admins only"""
     # Owner can use this in private chat with group ID parameter
@@ -566,7 +675,6 @@ async def fb_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         # Group chat - check admin permissions (including anonymous admins)
         if not await is_admin_or_owner(update, context):
-            await update.message.reply_text("❌ Only group administrators can use this command.")
             return
         group_id = update.effective_chat.id
     
@@ -598,7 +706,6 @@ async def check_user_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE
         
     # Check if user is admin or owner (including anonymous admins)
     if not await is_admin_or_owner(update, context):
-        await update.message.reply_text("❌ Only group administrators can use this command.")
         return
         
     group_id = update.effective_chat.id
@@ -679,7 +786,6 @@ async def addreminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         # Check if user is admin or owner (including anonymous admins)
         if not await is_admin_or_owner(update, context):
-            await update.message.reply_text("❌ Only group administrators can use this command.")
             return
         
         group_id = update.effective_chat.id
@@ -713,7 +819,6 @@ async def fbcount_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check if user is admin or owner
     # Check if user is admin or owner (including anonymous admins)
     if not await is_admin_or_owner(update, context):
-        await update.message.reply_text("❌ Only group administrators can use this command.")
         return
         
     group_id = update.effective_chat.id
@@ -736,10 +841,8 @@ async def fbcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ This command can only be used in groups.")
         return
         
-    # Check if user is admin or owner
     # Check if user is admin or owner (including anonymous admins)
     if not await is_admin_or_owner(update, context):
-        await update.message.reply_text("❌ Only group administrators can use this command.")
         return
     
     message = "🤖 **Bot Commands:**\n\n"
@@ -756,6 +859,9 @@ async def fbcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     message += "**For Owner:**\n"
     message += "• `/addgroup` - Authorize group (in group or DM with ID)\n"
     message += "• `/removegroup` - Remove group authorization (DM only)\n"
+    message += "• `/addauth <user_id>` - Manually authorize user for admin commands\n"
+    message += "• `/addplace <group_id>` - Set feedback forwarding group (DM only)\n"
+    message += "• `/logs` - Download bot log file (DM only)\n"
     message += "• `/addreminder` - Set reminders (in group or DM with ID)\n"
     message += "• `/cleardb` - Clear all feedback data\n\n"
     
@@ -866,11 +972,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     user.id, username, display_name, group_id, 1
                 )
                 
-                # Send confirmation message
-                member_name = display_name or username or f"User {user.id}"
-                await update.message.reply_text(f"Feedback received, Thank you {member_name}.")
+                await update.message.reply_text("✅ Feedback received! Thank you for sharing.")
+                logger.info(f"Feedback received from {username} ({user.id}) in group {group_id}")
+                
+                # Schedule feedback forwarding after 3-4 seconds
+                context.job_queue.run_once(
+                    lambda context: forward_feedback_delayed(context, message, user, group_name),
+                    when=3.5  # 3.5 seconds delay
+                )
                 
                 logger.info(f"Feedback logged from {username} in {group_name} (single media)")
+                
+                # Add to daily contest (reply to media)
+                feedback_bot.add_contest_feedback(
+                    user.id, username, display_name, group_id, 1
+                )
+                
+                # Schedule feedback forwarding after 3-4 seconds
+                context.job_queue.run_once(
+                    lambda context: forward_feedback_delayed(context, reply_msg, user, group_name),
+                    when=3.5  # 3.5 seconds delay
+                )
 
 async def handle_reply_to_single_media(update: Update, context: ContextTypes.DEFAULT_TYPE, reply_msg):
     """Handle #feedback reply to a single media message"""
@@ -940,30 +1062,14 @@ async def handle_reply_to_media_group(update: Update, context: ContextTypes.DEFA
     
     logger.info(f"Feedback logged from {username} in {group_name} (reply to media group)")
 
-async def process_media_group_delayed(context, media_group_id):
+async def process_media_group_delayed(context, media_group_id: str):
     """Process media group after delay to ensure all messages are collected"""
-    if media_group_id not in feedback_bot.media_groups:
-        return
+    if media_group_id in feedback_bot.media_groups:
+        media_group_data = feedback_bot.media_groups[media_group_id]
         
-    media_group_data = feedback_bot.media_groups[media_group_id]
-    
-    if media_group_data['has_feedback']:
-        # Count all media items in the group
-        media_count = len(media_group_data['messages'])
-        
-        # Add feedback entry (use first message for link)
-        first_message = media_group_data['messages'][0]
-        group_id = media_group_data['group_id']
-        
-        if context.bot_data.get('chat_username'):
-            message_link = f"https://t.me/{context.bot_data['chat_username']}/{first_message['message_id']}"
-        else:
-            message_link = f"https://t.me/c/{str(group_id)[4:]}/{first_message['message_id']}"
-            
-        feedback_bot.add_feedback(
-            media_group_data['user_id'], 
-            media_group_data['username'], 
-            media_group_data['display_name'], 
+        # Process the media group
+        media_count = feedback_bot.process_media_group(
+            media_group_id,
             group_id,
             media_group_data['group_name'], 
             message_link, 
@@ -996,6 +1102,52 @@ async def process_media_group_delayed(context, media_group_id):
     # Clean up media group data
     if media_group_id in feedback_bot.media_groups:
         del feedback_bot.media_groups[media_group_id]
+
+async def forward_feedback_delayed(context, message, user, group_name):
+    """Forward single feedback to the designated group after delay"""
+    forwarding_group_id = feedback_bot.get_forwarding_group()
+    if not forwarding_group_id:
+        return
+        
+    try:
+        username = user.username or user.full_name or f"User {user.id}"
+        
+        # Forward the original message only
+        await context.bot.forward_message(
+            chat_id=forwarding_group_id,
+            from_chat_id=message.chat_id,
+            message_id=message.message_id
+        )
+        
+        logger.info(f"Feedback forwarded to group {forwarding_group_id} from {username}")
+        
+    except Exception as e:
+        logger.error(f"Error forwarding feedback: {e}")
+
+async def forward_media_group_delayed(context, media_group_data, media_count):
+    """Forward media group feedback to the designated group after delay"""
+    forwarding_group_id = feedback_bot.get_forwarding_group()
+    if not forwarding_group_id:
+        return
+        
+    try:
+        username = media_group_data['username'] or media_group_data['display_name'] or f"User {media_group_data['user_id']}"
+        
+        # Forward all messages in the media group only
+        for msg_data in media_group_data['messages']:
+            try:
+                await context.bot.forward_message(
+                    chat_id=forwarding_group_id,
+                    from_chat_id=media_group_data['group_id'],
+                    message_id=msg_data['message_id']
+                )
+            except Exception as e:
+                logger.error(f"Error forwarding message {msg_data['message_id']}: {e}")
+        
+        logger.info(f"Media group feedback forwarded to group {forwarding_group_id} from {username}")
+        
+    except Exception as e:
+        logger.error(f"Error forwarding media group feedback: {e}")
 
 def create_flask_app():
     """Create Flask app for keep-alive"""
@@ -1108,6 +1260,8 @@ def main():
     application.add_handler(CommandHandler("addgroup", addgroup_command))
     application.add_handler(CommandHandler("removegroup", removegroup_command))
     application.add_handler(CommandHandler("addauth", addauth_command))
+    application.add_handler(CommandHandler("addplace", addplace_command))
+    application.add_handler(CommandHandler("logs", logs_command))
     application.add_handler(CommandHandler("fb_stats", fb_stats_command))
     application.add_handler(CommandHandler("check", check_user_feedback))
     application.add_handler(CommandHandler("cleardb", cleardb_command))

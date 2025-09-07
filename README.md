@@ -11,17 +11,27 @@ A powerful Telegram bot designed to collect and manage feedback from users in gr
 - **User Checking**: Check if specific users have submitted feedback
 - **Auto Cleanup**: Automatically removes feedback older than 5 days
 - **Reminders**: Set periodic reminders for group members
+- **Anonymous Admin Support**: Full support for anonymous admins (GroupAnonymousBot)
+- **Manual Authorization**: Owner can manually authorize users via `/addauth`
+- **Feedback Forwarding**: Automatically forwards all feedback to a designated group
+- **Daily Contest**: Tracks daily feedback contest with winner announcements
 
 ### Bot Commands
 
 | Command | Permission | Description |
 |---------|------------|-------------|
 | `/start` | Everyone | Welcome message |
-| `/addgroup` | Owner Only | Authorize a group to use the bot |
-| `/fb_stats` | Group Members | Show feedback statistics for last 3 days |
-| `/!` | Admins Only | Check user's feedback (reply to user's message) |
+| `/addgroup [group_id]` | Owner Only | Authorize a group (in group or DM with ID) |
+| `/removegroup <group_id>` | Owner Only | Remove group authorization (DM only) |
+| `/addauth <user_id>` | Owner Only | Manually authorize a user to use admin commands |
+| `/addplace <group_id>` | Owner Only | Set feedback forwarding group (DM only) |
+| `/logs` | Owner Only | Download bot log file (DM only) |
+| `/fb_stats [group_id]` | Admins Only / Owner | Show feedback statistics for last 3 days |
+| `/check @user` | Admins Only | Check user's feedback (reply or mention) |
+| `/fbcount` | Admins Only | Show feedback count statistics |
+| `/fbcommands` | Admins Only | Show all available commands |
 | `/cleardb` | Owner Only | Clear all feedback data |
-| `/addreminder <text>` | Admins Only | Set periodic reminder message |
+| `/addreminder <text>` | Admins Only / Owner | Set periodic reminder message |
 
 ## 🛠️ Setup & Deployment
 
@@ -84,11 +94,11 @@ Users can submit feedback in two ways:
 
 ### 3. Check Statistics
 - Run `/fb_stats` to see all feedback from last 3 days
-- Reply to any user's message with `/!` to check their feedback history
+- Reply to messages with `/check` to check user feedback history
 
 ### 4. Set Reminders
 - Admins can use `/addreminder <text>` to set periodic reminders
-- Reminders are sent every 2 hours by default
+- Reminders are sent 8 times daily at: 1 AM, 4 AM, 7 AM, 10 AM, 1 PM, 4 PM, 7 PM, 10 PM UTC
 
 ## 🏗️ Project Structure
 
@@ -104,10 +114,12 @@ telegram-feedback-bot/
 ## 🔧 Technical Details
 
 ### Database Schema
-The bot uses SQLite with three main tables:
-- **feedback**: Stores all feedback entries
+The bot uses SQLite with five main tables:
+- **feedback**: Stores all feedback entries with media count
 - **authorized_groups**: Groups allowed to use the bot
+- **authorized_users**: Manually authorized users for admin commands
 - **reminders**: Reminder messages for groups
+- **daily_contest**: Daily feedback contest tracking
 
 ### Keep-Alive Mechanism
 - Flask server runs on port 8080 with health endpoint
@@ -117,13 +129,18 @@ The bot uses SQLite with three main tables:
 ### Background Tasks
 - **Cleanup Task**: Runs every 24 hours to remove old feedback
 - **Reminder Task**: Sends reminders every 2 hours (configurable)
+- **Contest Announcement**: Daily winner announcements at 2:30 PM UTC
+- **Feedback Forwarding**: Automatic forwarding with 3-4 second delay
 
 ## 🚨 Important Notes
 
 ### Security
 - Only the bot owner can authorize groups (`/addgroup`)
+- Only the bot owner can manually authorize users (`/addauth`)
+- Only the bot owner can set feedback forwarding (`/addplace`)
 - Only the bot owner can clear database (`/cleardb`)
-- Only group admins can set reminders (`/addreminder`)
+- Only group admins and authorized users can use admin commands
+- Anonymous admins (GroupAnonymousBot) are automatically recognized
 - Bot only works in authorized groups
 
 ### Limitations
