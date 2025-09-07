@@ -374,6 +374,37 @@ class FeedbackBot:
             del self.media_groups[media_group_id]
             return 0
 
+async def is_admin_or_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check if user is owner, admin, or anonymous admin"""
+    user_id = update.effective_user.id
+    
+    # Owner can always use commands
+    if user_id == OWNER_ID:
+        return True
+    
+    # Check if user is admin or anonymous admin
+    try:
+        chat_member = await context.bot.get_chat_member(update.effective_chat.id, user_id)
+        
+        # Regular admin or creator
+        if chat_member.status in ['administrator', 'creator']:
+            return True
+            
+        # Check for anonymous admin
+        # Anonymous admins have is_anonymous=True and user.id matches the chat.id
+        if hasattr(chat_member, 'is_anonymous') and chat_member.is_anonymous:
+            return True
+            
+        # Alternative check: anonymous admins often have user_id same as chat_id (negative)
+        if user_id == update.effective_chat.id:
+            return True
+            
+        return False
+        
+    except Exception as e:
+        logger.error(f"Error checking admin status: {e}")
+        return False
+
 # Initialize bot instance
 feedback_bot = FeedbackBot()
 
@@ -466,12 +497,10 @@ async def fb_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ This command can only be used in groups.")
             return
     else:
-        # Check if user is admin or owner
-        if update.effective_user.id != OWNER_ID:
-            chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
-            if chat_member.status not in ['administrator', 'creator']:
-                await update.message.reply_text("❌ Only group administrators can use this command.")
-                return
+        # Group chat - check admin permissions (including anonymous admins)
+        if not await is_admin_or_owner(update, context):
+            await update.message.reply_text("❌ Only group administrators can use this command.")
+            return
         group_id = update.effective_chat.id
     
     if not feedback_bot.is_group_authorized(group_id):
@@ -500,12 +529,10 @@ async def check_user_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if update.effective_chat.type == 'private':
         return
         
-    # Check if user is admin or owner
-    if update.effective_user.id != OWNER_ID:
-        chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
-        if chat_member.status not in ['administrator', 'creator']:
-            await update.message.reply_text("❌ Only group administrators can use this command.")
-            return
+    # Check if user is admin or owner (including anonymous admins)
+    if not await is_admin_or_owner(update, context):
+        await update.message.reply_text("❌ Only group administrators can use this command.")
+        return
         
     group_id = update.effective_chat.id
     
@@ -583,12 +610,10 @@ async def addreminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("❌ This command can only be used in groups.")
             return
     else:
-        # Check if user is admin or owner
-        if update.effective_user.id != OWNER_ID:
-            chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
-            if chat_member.status not in ['administrator', 'creator']:
-                await update.message.reply_text("❌ Only group administrators can use this command.")
-                return
+        # Check if user is admin or owner (including anonymous admins)
+        if not await is_admin_or_owner(update, context):
+            await update.message.reply_text("❌ Only group administrators can use this command.")
+            return
         
         group_id = update.effective_chat.id
         
@@ -619,11 +644,10 @@ async def fbcount_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     # Check if user is admin or owner
-    if update.effective_user.id != OWNER_ID:
-        chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
-        if chat_member.status not in ['administrator', 'creator']:
-            await update.message.reply_text("❌ Only group administrators can use this command.")
-            return
+    # Check if user is admin or owner (including anonymous admins)
+    if not await is_admin_or_owner(update, context):
+        await update.message.reply_text("❌ Only group administrators can use this command.")
+        return
         
     group_id = update.effective_chat.id
     
@@ -646,11 +670,10 @@ async def fbcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
         
     # Check if user is admin or owner
-    if update.effective_user.id != OWNER_ID:
-        chat_member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
-        if chat_member.status not in ['administrator', 'creator']:
-            await update.message.reply_text("❌ Only group administrators can use this command.")
-            return
+    # Check if user is admin or owner (including anonymous admins)
+    if not await is_admin_or_owner(update, context):
+        await update.message.reply_text("❌ Only group administrators can use this command.")
+        return
     
     message = "🤖 **Bot Commands:**\n\n"
     message += "**For Everyone:**\n"
