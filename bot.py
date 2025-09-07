@@ -405,34 +405,28 @@ def run_flask_app():
     app = create_flask_app()
     app.run(host='0.0.0.0', port=PORT, debug=False)
 
-async def cleanup_task():
-    """Periodic cleanup task"""
-    while True:
-        try:
-            await asyncio.sleep(86400)  # 24 hours
-            feedback_bot.cleanup_old_feedback()
-        except Exception as e:
-            logger.error(f"Error in cleanup task: {e}")
+async def cleanup_job(context):
+    """Cleanup job for removing old feedback"""
+    try:
+        feedback_bot.cleanup_old_feedback()
+    except Exception as e:
+        logger.error(f"Error in cleanup job: {e}")
 
-async def reminder_task(application):
-    """Periodic reminder task"""
-    while True:
-        try:
-            await asyncio.sleep(REMINDER_INTERVAL)
-            
-            # Send reminders to all groups that have them
-            for group_id, reminder_text in feedback_bot.group_reminders.items():
-                try:
-                    await application.bot.send_message(
-                        chat_id=group_id,
-                        text=f"🔔 **Reminder:** {reminder_text}",
-                        parse_mode='Markdown'
-                    )
-                except TelegramError as e:
-                    logger.error(f"Failed to send reminder to group {group_id}: {e}")
-                    
-        except Exception as e:
-            logger.error(f"Error in reminder task: {e}")
+async def reminder_job(context):
+    """Reminder job for sending periodic reminders"""
+    try:
+        # Send reminders to all groups that have them
+        for group_id, reminder_text in feedback_bot.group_reminders.items():
+            try:
+                await context.bot.send_message(
+                    chat_id=group_id,
+                    text=f"🔔 **Reminder:** {reminder_text}",
+                    parse_mode='Markdown'
+                )
+            except TelegramError as e:
+                logger.error(f"Failed to send reminder to group {group_id}: {e}")
+    except Exception as e:
+        logger.error(f"Error in reminder job: {e}")
 
 def main():
     """Main function to run the bot"""
@@ -460,9 +454,22 @@ def main():
     application.add_handler(CommandHandler("addreminder", addreminder_command))
     application.add_handler(MessageHandler(filters.ALL, handle_message))
     
-    # Start background tasks
-    asyncio.create_task(cleanup_task())
-    asyncio.create_task(reminder_task(application))
+    # Add job queue for background tasks
+    job_queue = application.job_queue
+    
+    # Schedule cleanup job to run daily
+    job_queue.run_repeating(
+        cleanup_job,
+        interval=86400,  # 24 hours
+        first=10  # Start after 10 seconds
+    )
+    
+    # Schedule reminder job
+    job_queue.run_repeating(
+        reminder_job,
+        interval=REMINDER_INTERVAL,
+        first=30  # Start after 30 seconds
+    )
     
     # Start the bot
     logger.info("Starting Telegram Feedback Bot...")
