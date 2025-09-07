@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: telegram-feedback-bot
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: REMINDER_INTERVAL
+        value: "7200"
+      - key: PORT
+        value: "8080"
+    healthCheckPath: /health
+    autoDeploy: true
+    disk:
+      name: feedback-bot-disk
+      mountPath: /app/data
+      sizeGB: 1
