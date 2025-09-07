@@ -85,9 +85,20 @@ class FeedbackBot:
                 username TEXT,
                 display_name TEXT,
                 group_id INTEGER NOT NULL,
-                contest_date DATE NOT NULL,
+                contest_date TEXT NOT NULL,
                 feedback_count INTEGER DEFAULT 0,
                 UNIQUE(user_id, group_id, contest_date)
+            )
+        ''')
+        
+        # Authorized users table (for manual authorization)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS authorized_users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                display_name TEXT,
+                added_by INTEGER,
+                added_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
@@ -350,6 +361,30 @@ class FeedbackBot:
             
         return winner, runner_up
         
+    def add_authorized_user(self, user_id: int, username: str, display_name: str, added_by: int):
+        """Add authorized user to database"""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT OR REPLACE INTO authorized_users (user_id, username, display_name, added_by)
+            VALUES (?, ?, ?, ?)
+        ''', (user_id, username, display_name, added_by))
+        
+        conn.commit()
+        conn.close()
+        
+    def is_user_authorized(self, user_id: int) -> bool:
+        """Check if user is manually authorized"""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT user_id FROM authorized_users WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+        conn.close()
+        
+        return result is not None
+        
     def process_media_group(self, media_group_id: str, user_id: int, username: str, 
                           display_name: str, group_id: int):
         """Process completed media group and count all items if #feedback found"""
@@ -375,7 +410,7 @@ class FeedbackBot:
             return 0
 
 async def is_admin_or_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Check if user is owner, admin, anonymous admin, or authorized group"""
+    """Check if user is owner, admin, anonymous admin, or manually authorized"""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     
@@ -383,30 +418,34 @@ async def is_admin_or_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if user_id == OWNER_ID:
         return True
     
-    # Check if the sender ID matches the current group ID (group sending as admin)
-    if user_id == chat_id and feedback_bot.is_group_authorized(chat_id):
+    # Check if user is manually authorized
+    if feedback_bot.is_user_authorized(user_id):
         return True
+    
+    # Debug logging
+    logger.info(f"Checking admin status for user_id: {user_id}, chat_id: {chat_id}")
     
     # Check if user is admin or anonymous admin
     try:
         chat_member = await context.bot.get_chat_member(chat_id, user_id)
+        logger.info(f"Chat member status: {chat_member.status}, is_anonymous: {getattr(chat_member, 'is_anonymous', False)}")
         
         # Regular admin or creator
         if chat_member.status in ['administrator', 'creator']:
             return True
             
         # Check for anonymous admin
-        # Anonymous admins have is_anonymous=True and user.id matches the chat.id
         if hasattr(chat_member, 'is_anonymous') and chat_member.is_anonymous:
+            return True
+            
+        # Check if the sender ID matches the current group ID (anonymous admin pattern)
+        if user_id == chat_id:
             return True
             
         return False
         
     except Exception as e:
-        logger.error(f"Error checking admin status: {e}")
-        # Fallback: if sender ID matches any authorized group ID, allow it
-        if feedback_bot.is_group_authorized(user_id):
-            return True
+        logger.error(f"Error checking admin status for user {user_id}: {e}")
         return False
 
 # Initialize bot instance
@@ -455,40 +494,51 @@ async def removegroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text("❌ Only the bot owner can use this command.")
         return
-    
-    # Only works in private chat
-    if update.effective_chat.type != 'private':
-        await update.message.reply_text("❌ This command can only be used in bot's private messages.")
-        return
         
     if not context.args:
         await update.message.reply_text("❌ Please provide group ID. Usage: /removegroup -1002373349798")
         return
-        
-    try:
-        group_id = int(context.args[0])
-        # Try to get group info for confirmation
-        try:
-            chat = await context.bot.get_chat(group_id)
-            group_name = chat.title or "Unknown Group"
-        except Exception:
-            group_name = f"Group {group_id}"
-            
-        deleted_count = feedback_bot.remove_authorized_group(group_id)
-        
-        if deleted_count > 0:
-            await update.message.reply_text(f"✅ Group '{group_name}' (ID: {group_id}) has been removed from authorized groups!")
-        else:
+{{ ... }}
             await update.message.reply_text(f"❌ Group {group_id} was not found in authorized groups.")
             
     except ValueError:
         await update.message.reply_text("❌ Invalid group ID format. Usage: /removegroup -1002373349798")
+
+async def addauth_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /addauth command - Owner only (authorize specific users)"""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Only the bot owner can use this command.")
+        return
+        
+    if not context.args:
+        await update.message.reply_text("❌ Please provide user ID. Usage: /addauth 123456789")
+        return
+        
+    try:
+        user_id = int(context.args[0])
+        
+        # Try to get user info
+        try:
+            chat_member = await context.bot.get_chat_member(user_id, user_id)
+            user = chat_member.user
+            username = user.username
+            display_name = user.full_name
+        except Exception:
+            username = None
+            display_name = f"User {user_id}"
+            
+        feedback_bot.add_authorized_user(user_id, username, display_name, OWNER_ID)
+        await update.message.reply_text(f"✅ User {display_name} (ID: {user_id}) has been authorized to use admin commands!")
+        
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID format. Usage: /addauth 123456789")
 
 async def fb_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /fb_stats command - Admins only"""
     # Owner can use this in private chat with group ID parameter
     if update.effective_chat.type == 'private':
         if update.effective_user.id == OWNER_ID:
+{{ ... }}
             if not context.args:
                 await update.message.reply_text("❌ Please provide group ID. Usage: /fb_stats -1002373349798")
                 return
@@ -1044,6 +1094,7 @@ def main():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("addgroup", addgroup_command))
     application.add_handler(CommandHandler("removegroup", removegroup_command))
+    application.add_handler(CommandHandler("addauth", addauth_command))
     application.add_handler(CommandHandler("fb_stats", fb_stats_command))
     application.add_handler(CommandHandler("check", check_user_feedback))
     application.add_handler(CommandHandler("cleardb", cleardb_command))
