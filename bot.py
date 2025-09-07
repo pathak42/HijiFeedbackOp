@@ -268,7 +268,7 @@ async def fb_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(message, parse_mode='Markdown', disable_web_page_preview=True)
 
 async def check_user_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /! command - Check user feedback - Admins only"""
+    """Handle /check command - Check user feedback - Admins only"""
     if update.effective_chat.type == 'private':
         return
         
@@ -455,7 +455,7 @@ def main():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("addgroup", addgroup_command))
     application.add_handler(CommandHandler("fb_stats", fb_stats_command))
-    application.add_handler(CommandHandler("!", check_user_feedback))
+    application.add_handler(CommandHandler("check", check_user_feedback))
     application.add_handler(CommandHandler("cleardb", cleardb_command))
     application.add_handler(CommandHandler("addreminder", addreminder_command))
     application.add_handler(MessageHandler(filters.ALL, handle_message))
