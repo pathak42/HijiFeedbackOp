@@ -972,7 +972,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     user.id, username, display_name, group_id, 1
                 )
                 
-                await update.message.reply_text("✅ Feedback received! Thank you for sharing.")
+                await update.message.reply_text("✅ Feedback received! Thank you for sharing,\nCheck ur feedbacks here @HijiFbDump🦄")
                 logger.info(f"Feedback received from {username} ({user.id}) in group {group_id}")
                 
                 # Schedule feedback forwarding after 3-4 seconds
