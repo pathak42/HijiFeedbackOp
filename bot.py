@@ -910,39 +910,60 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if message.media_group_id:
         media_group_id = message.media_group_id
         
+        # Check if any message in the media group has #feedback
+        has_feedback = '#feedback' in text.lower()
+        
         # Initialize media group tracking if not exists
         if media_group_id not in feedback_bot.media_groups:
             feedback_bot.media_groups[media_group_id] = {
                 'messages': [],
-                'has_feedback': False,
+                'has_feedback': has_feedback,
                 'user_id': user.id,
-                'username': username,
-                'display_name': display_name,
+                'username': username or '',
+                'display_name': display_name or f"User {user.id}",
                 'group_id': group_id,
-                'group_name': group_name
+                'group_name': group_name,
+                'media_group_id': media_group_id,  # Store for cleanup
+                'processing_scheduled': False  # Flag to track if processing is already scheduled
             }
+        else:
+            # Update has_feedback if this message has the tag
+            if has_feedback:
+                feedback_bot.media_groups[media_group_id]['has_feedback'] = True
         
-        # Add this message to the media group
-        feedback_bot.media_groups[media_group_id]['messages'].append({
-            'message_id': message.message_id,
-            'text': text,
-            'has_media': has_media
-        })
+        # Add this message to the media group if not already added
+        message_exists = any(msg.get('message_id') == message.message_id for msg in feedback_bot.media_groups[media_group_id]['messages'])
+        if not message_exists:
+            feedback_bot.media_groups[media_group_id]['messages'].append({
+                'message_id': message.message_id,
+                'text': text,
+                'has_media': has_media
+            })
         
-        # Check if this message contains #feedback
-        if '#feedback' in text.lower():
-            feedback_bot.media_groups[media_group_id]['has_feedback'] = True
-            
         # Schedule processing of media group after a delay (to collect all messages)
-        context.job_queue.run_once(
-            lambda context: process_media_group_delayed(context, media_group_id),
-            when=2.0  # 2 seconds delay
-        )
+        # Only schedule if not already scheduled and if we have feedback
+        media_group = feedback_bot.media_groups[media_group_id]
+        if not media_group.get('processing_scheduled', False) and media_group['has_feedback']:
+            media_group['processing_scheduled'] = True
+            context.job_queue.run_once(
+                lambda ctx, mg_id=media_group_id: process_media_group_delayed(ctx, mg_id),
+                when=2.0  # 2 seconds delay
+            )
+        elif not media_group['has_feedback']:
+            # If no feedback tag found, clean up after a while
+            async def cleanup_media_group(context, mg_id):
+                if mg_id in feedback_bot.media_groups:
+                    del feedback_bot.media_groups[mg_id]
+            
+            context.job_queue.run_once(
+                lambda ctx, mg_id=media_group_id: cleanup_media_group(ctx, mg_id),
+                when=10.0  # 10 seconds delay before cleanup
+            )
         
     else:
         # Handle single media message or reply to media
         if '#feedback' in text.lower():
-            # Determine if this is a reply to media from same user
+            # Handle reply to media (from same user only)
             if is_reply_to_media and reply_from_same_user:
                 # Handle reply to media (possibly media group)
                 reply_msg = message.reply_to_message
@@ -972,7 +993,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     user.id, username, display_name, group_id, 1
                 )
                 
-                await update.message.reply_text("✅ Feedback received! Thank you for sharing,\nCheck ur feedbacks here @HijiFbDump🦄")
+                member_name = display_name or username or f"User {user.id}"
+                await update.message.reply_text(f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here @HijiFbDump🦄")
                 logger.info(f"Feedback received from {username} ({user.id}) in group {group_id}")
                 
                 # Schedule feedback forwarding after 3-4 seconds
@@ -990,7 +1012,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 # Schedule feedback forwarding after 3-4 seconds
                 context.job_queue.run_once(
-                    lambda context: forward_feedback_delayed(context, reply_msg, user, group_name),
+                    lambda ctx: forward_feedback_delayed(ctx, reply_msg, user, group_name),
                     when=3.5  # 3.5 seconds delay
                 )
 
@@ -1020,62 +1042,222 @@ async def handle_reply_to_single_media(update: Update, context: ContextTypes.DEF
     
     # Send confirmation message
     member_name = display_name or username or f"User {user.id}"
-    await update.message.reply_text(f"Feedback received, Thank you {member_name}.")
+    await update.message.reply_text(f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here @HijiFbDump🦄")
     
     logger.info(f"Feedback logged from {username} in {group_name} (reply to single media)")
+    
+    # Schedule feedback forwarding after 3-4 seconds
+    context.job_queue.run_once(
+        lambda ctx: forward_feedback_delayed(ctx, reply_msg, user, group_name),
+        when=3.5  # 3.5 seconds delay
+    )
 
 async def handle_reply_to_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE, reply_msg):
-    """Handle #feedback reply to a media group - count all items in the group"""
-    group_id = update.effective_chat.id
-    user = update.message.from_user
-    username = user.username
-    display_name = user.full_name
-    group_name = update.effective_chat.title or "Unknown Group"
-    
-    # For media group replies, we need to estimate the group size
-    # Since we can't easily get all messages in a media group retroactively,
-    # we'll use a heuristic approach or store media group info when first seen
-    
-    # Create message link to the replied media (part of the group)
-    if update.effective_chat.username:
-        message_link = f"https://t.me/{update.effective_chat.username}/{reply_msg.message_id}"
-    else:
-        message_link = f"https://t.me/c/{str(group_id)[4:]}/{reply_msg.message_id}"
-    
-    # For now, we'll count it as 1 item since we can't retroactively count the full group
-    # In a production system, you might want to store media group info when first received
-    media_count = 1
-    
-    feedback_bot.add_feedback(
-        user.id, username, display_name, group_id, 
-        group_name, message_link, reply_msg.message_id, media_count
-    )
-    
-    # Add to daily contest
-    feedback_bot.add_contest_feedback(
-        user.id, username, display_name, group_id, media_count
-    )
-    
-    # Send confirmation message
-    member_name = display_name or username or f"User {user.id}"
-    await update.message.reply_text(f"Feedback received, Thank you {member_name}. (Reply to media group)")
-    
-    logger.info(f"Feedback logged from {username} in {group_name} (reply to media group)")
+    """Handle #feedback reply to a media group - forward entire group and count all items"""
+    try:
+        # Get the media group ID from the replied message
+        if not hasattr(reply_msg, 'media_group_id') or not reply_msg.media_group_id:
+            logger.warning("Replied message is not part of a media group")
+            return
+            
+        media_group_id = reply_msg.media_group_id
+        group_id = update.effective_chat.id
+        user = update.effective_user
+        username = user.username or user.full_name or f"User {user.id}"
+        group_name = update.effective_chat.title or "Unknown Group"
+        
+        # Get the media group data if it exists
+        media_group_data = feedback_bot.media_groups.get(media_group_id)
+        if not media_group_data:
+            logger.warning(f"No media group data found for ID: {media_group_id}")
+            # Try to find the media group by searching recent messages
+            await find_and_process_media_group(update, context, media_group_id, reply_msg.message_id)
+            return
+            
+        # Since this is a reply with #feedback, we should process the media group
+        # The #feedback tag is in the reply message, not necessarily in the original media group
+            
+        # Count all media in the group
+        media_count = len(media_group_data['messages'])
+        
+        # Add feedback for each message in the group
+        # Use the original media sender's info (since only they can reply with feedback)
+        for msg_data in media_group_data['messages']:
+            try:
+                if update.effective_chat.username:
+                    message_link = f"https://t.me/{update.effective_chat.username}/{msg_data['message_id']}"
+                else:
+                    message_link = f"https://t.me/c/{str(group_id).replace('-100', '')}/{msg_data['message_id']}"
+                
+                feedback_bot.add_feedback(
+                    media_group_data['user_id'],
+                    media_group_data['username'],
+                    media_group_data['display_name'],
+                    group_id,
+                    group_name,
+                    message_link,
+                    msg_data['message_id'],
+                    1  # Each message counts as 1 feedback
+                )
+            except Exception as e:
+                logger.error(f"Error adding feedback for message {msg_data['message_id']}: {e}")
+        
+        # Add to contest with full media count
+        # Use the original media sender's info for contest tracking
+        feedback_bot.add_contest_feedback(
+            media_group_data['user_id'],
+            media_group_data['username'],
+            media_group_data['display_name'],
+            group_id,
+            media_count
+        )
+        
+        # Mark that this media group has been processed for feedback
+        media_group_data['has_feedback'] = True
+        
+        # Send confirmation message
+        member_name = media_group_data['display_name'] or media_group_data['username'] or f"User {media_group_data['user_id']}"
+        
+        try:
+            await update.message.reply_text(
+                f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here @HijiFbDump🦄"
+            )
+        except Exception as e:
+            logger.error(f"Failed to send confirmation for media group reply: {e}")
+            
+        logger.info(f"Media group feedback logged from {media_group_data['username']} in {group_name} (count: {media_count})")
+        
+        # Schedule feedback forwarding for media group after a short delay
+        if media_count > 0:
+            context.job_queue.run_once(
+                lambda ctx, mgd=media_group_data, mc=media_count: forward_media_group_delayed(ctx, mgd, mc),
+                when=3.5  # 3.5 seconds delay before forwarding
+            )
+    except Exception as e:
+        logger.error(f"Error in handle_reply_to_media_group: {e}")
+        try:
+            await update.message.reply_text("❌ An error occurred while processing your feedback. Please try again.")
+        except Exception as e2:
+            logger.error(f"Failed to send error message: {e2}")
+
+async def find_and_process_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE, media_group_id: str, message_id: int):
+    """Try to find and process a media group by searching recent messages"""
+    try:
+        # Try to get recent messages to find the media group
+        messages = []
+        try:
+            # Get the chat ID and message ID
+            chat_id = update.effective_chat.id
+            
+            # Get the original message first
+            try:
+                original_msg = await context.bot.get_message(chat_id=chat_id, message_id=message_id)
+                if hasattr(original_msg, 'media_group_id') and original_msg.media_group_id == media_group_id:
+                    messages.append(original_msg)
+            except Exception as e:
+                logger.error(f"Error getting original message: {e}")
+                return
+                
+            # Try to get messages around the original message to find the full media group
+            try:
+                # Get messages before and after the original message
+                history = await context.bot.get_chat_history(
+                    chat_id=chat_id,
+                    limit=10,  # Check 10 messages around the original
+                    offset_id=message_id - 5,  # Start 5 messages before
+                    reverse=True
+                )
+                
+                async for msg in history:
+                    if hasattr(msg, 'media_group_id') and msg.media_group_id == media_group_id:
+                        if not any(m.message_id == msg.message_id for m in messages):
+                            messages.append(msg)
+            except Exception as e:
+                logger.error(f"Error getting chat history: {e}")
+                
+            # If we found any messages in the media group, process them
+            if messages:
+                # Create a new media group data entry
+                first_msg = messages[0]
+                media_group_data = {
+                    'messages': [{
+                        'message_id': msg.message_id,
+                        'text': msg.caption or '',
+                        'has_media': True
+                    } for msg in messages],
+                    'has_feedback': True,
+                    'user_id': first_msg.from_user.id,
+                    'username': first_msg.from_user.username or '',
+                    'display_name': first_msg.from_user.full_name or f"User {first_msg.from_user.id}",
+                    'group_id': chat_id,
+                    'group_name': update.effective_chat.title or "Unknown Group",
+                    'media_group_id': media_group_id,
+                    'processed': False
+                }
+                
+                # Store the media group data
+                feedback_bot.media_groups[media_group_id] = media_group_data
+                
+                # Process the media group
+                await process_media_group_delayed(context, media_group_id)
+                
+        except Exception as e:
+            logger.error(f"Error searching for media group: {e}")
+            
+    except Exception as e:
+        logger.error(f"Error in find_and_process_media_group: {e}")
 
 async def process_media_group_delayed(context, media_group_id: str):
     """Process media group after delay to ensure all messages are collected"""
-    if media_group_id in feedback_bot.media_groups:
-        media_group_data = feedback_bot.media_groups[media_group_id]
+    # Skip if media group already processed or doesn't exist
+    if media_group_id not in feedback_bot.media_groups:
+        return
         
+    media_group_data = feedback_bot.media_groups[media_group_id]
+    
+    # Skip if already processed
+    if media_group_data.get('processed', False):
+        return
+    
+    # Mark as processed to prevent duplicate processing
+    media_group_data['processed'] = True
+    
+    # Get group info from media group data
+    group_id = media_group_data['group_id']
+    group_name = media_group_data['group_name']
+    
+    try:
         # Process the media group
-        media_count = feedback_bot.process_media_group(
-            media_group_id,
-            group_id,
-            media_group_data['group_name'], 
-            message_link, 
-            first_message['message_id'],
-            media_count
-        )
+        media_count = len(media_group_data['messages'])
+        first_message = media_group_data['messages'][0] if media_count > 0 else None
+        
+        if not first_message:
+            logger.warning(f"No messages found in media group {media_group_id}")
+            return
+        
+        # Check if any message in the group has #feedback
+        has_feedback = any('#feedback' in (msg.get('text', '') or '').lower() 
+                          for msg in media_group_data['messages'])
+        
+        if not has_feedback and not media_group_data.get('has_feedback', False):
+            logger.info(f"No #feedback tag found in media group {media_group_id}, ignoring")
+            return
+        
+        # Add feedback for each message in the group
+        for msg_data in media_group_data['messages']:
+            try:
+                feedback_bot.add_feedback(
+                    media_group_data['user_id'],
+                    media_group_data['username'],
+                    media_group_data['display_name'],
+                    group_id,
+                    group_name,
+                    f"https://t.me/c/{str(group_id).replace('-100', '')}/{msg_data['message_id']}",
+                    msg_data['message_id'],
+                    1  # Each message counts as 1 feedback
+                )
+            except Exception as e:
+                logger.error(f"Error adding feedback for message {msg_data['message_id']} in group {media_group_id}: {e}")
         
         # Add to contest with full media count
         feedback_bot.add_contest_feedback(
@@ -1092,16 +1274,25 @@ async def process_media_group_delayed(context, media_group_id: str):
         try:
             await context.bot.send_message(
                 chat_id=group_id,
-                text=f"Feedback received, Thank you {member_name}. ({media_count} items counted)"
+                text=f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here @HijiFbDump🦄"
             )
         except Exception as e:
             logger.error(f"Failed to send confirmation for media group: {e}")
             
         logger.info(f"Media group feedback logged from {media_group_data['username']} in {media_group_data['group_name']} (count: {media_count})")
-    
-    # Clean up media group data
-    if media_group_id in feedback_bot.media_groups:
-        del feedback_bot.media_groups[media_group_id]
+        
+        # Schedule feedback forwarding for media group after a short delay
+        if media_count > 0:
+            context.job_queue.run_once(
+                lambda ctx, mgd=media_group_data, mc=media_count: forward_media_group_delayed(ctx, mgd, mc),
+                when=1.5  # 1.5 seconds delay before forwarding
+            )
+    except Exception as e:
+        logger.error(f"Error processing media group {media_group_id}: {e}")
+    finally:
+        # Clean up media group data after processing
+        if media_group_id in feedback_bot.media_groups:
+            del feedback_bot.media_groups[media_group_id]
 
 async def forward_feedback_delayed(context, message, user, group_name):
     """Forward single feedback to the designated group after delay"""
@@ -1129,25 +1320,57 @@ async def forward_media_group_delayed(context, media_group_data, media_count):
     forwarding_group_id = feedback_bot.get_forwarding_group()
     if not forwarding_group_id:
         return
-        
+    
+    # Check if this media group has already been forwarded
+    if media_group_data.get('forwarded', False):
+        logger.info(f"Media group already forwarded, skipping")
+        return
+    
+    # Mark as forwarded to prevent duplicate forwarding
+    media_group_data['forwarded'] = True
+    
     try:
-        username = media_group_data['username'] or media_group_data['display_name'] or f"User {media_group_data['user_id']}"
+        group_id = media_group_data['group_id']
+        user_id = media_group_data['user_id']
+        username = media_group_data['username']
+        display_name = media_group_data['display_name']
         
-        # Forward all messages in the media group only
-        for msg_data in media_group_data['messages']:
+        # Sort messages by message_id to maintain original order
+        messages = sorted(media_group_data['messages'], key=lambda x: x['message_id'])
+        
+        # Forward each message in the media group
+        for msg_data in messages:
             try:
                 await context.bot.forward_message(
                     chat_id=forwarding_group_id,
-                    from_chat_id=media_group_data['group_id'],
+                    from_chat_id=group_id,
                     message_id=msg_data['message_id']
                 )
+                # Small delay between forwards to avoid rate limiting
+                await asyncio.sleep(0.5)
             except Exception as e:
-                logger.error(f"Error forwarding message {msg_data['message_id']}: {e}")
+                logger.error(f"Error forwarding message {msg_data['message_id']} from media group: {e}")
         
         logger.info(f"Media group feedback forwarded to group {forwarding_group_id} from {username}")
         
+        # Send a summary message
+        try:
+            member_name = display_name or username or f"User {user_id}"
+            await context.bot.send_message(
+                chat_id=forwarding_group_id,
+                text=f"📨 Forwarded media group feedback from {member_name} ({media_count} items)"
+            )
+        except Exception as e:
+            logger.error(f"Error sending summary message: {e}")
+        
     except Exception as e:
-        logger.error(f"Error forwarding media group feedback: {e}")
+        logger.error(f"Error in forward_media_group_delayed: {e}")
+    finally:
+        # Clean up the media group data after forwarding is complete
+        if 'media_group_id' in media_group_data:
+            media_group_id = media_group_data.get('media_group_id')
+            if media_group_id and media_group_id in feedback_bot.media_groups:
+                del feedback_bot.media_groups[media_group_id]
 
 def create_flask_app():
     """Create Flask app for keep-alive"""
