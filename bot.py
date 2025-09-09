@@ -44,9 +44,11 @@ class FeedbackBot:
         self.authorized_groups = set()
         self.group_reminders = {}
         self.media_groups = {}  # Track media groups: {media_group_id: {'messages': [], 'has_feedback': False, 'user_id': int, 'group_id': int}}
-        self.forwarding_group_id = None  # In-memory storage for forwarding group
+        self.forwarding_group_id = None  # Will be loaded from database or env
         self.init_database()
         self.load_authorized_groups()
+        self.load_bot_settings()
+        self.load_env_config()
         
     def init_database(self):
         """Initialize SQLite database with required tables"""
@@ -121,6 +123,15 @@ class FeedbackBot:
             )
         ''')
         
+        # Bot settings table for persistent configuration
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
         conn.commit()
         conn.close()
         
@@ -131,6 +142,61 @@ class FeedbackBot:
         cursor.execute('SELECT group_id FROM authorized_groups')
         rows = cursor.fetchall()
         self.authorized_groups = {row[0] for row in rows}
+        conn.close()
+        
+    def load_bot_settings(self):
+        """Load bot settings from database"""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('SELECT key, value FROM bot_settings')
+        settings = cursor.fetchall()
+        
+        for key, value in settings:
+            if key == 'forwarding_group_id' and value:
+                self.forwarding_group_id = int(value)
+        
+        conn.close()
+        
+    def load_env_config(self):
+        """Load configuration from environment variables"""
+        # Load authorized groups from environment variable
+        env_groups = os.getenv('AUTHORIZED_GROUPS', '')
+        if env_groups:
+            try:
+                # Format: "group_id1:group_name1,group_id2:group_name2"
+                for group_info in env_groups.split(','):
+                    if ':' in group_info:
+                        group_id_str, group_name = group_info.strip().split(':', 1)
+                        group_id = int(group_id_str.strip())
+                        group_name = group_name.strip()
+                        
+                        # Add to authorized groups if not already present
+                        if group_id not in self.authorized_groups:
+                            self.add_authorized_group(group_id, group_name)
+                            logger.info(f"Added authorized group from env: {group_name} ({group_id})")
+            except Exception as e:
+                logger.error(f"Error loading authorized groups from environment: {e}")
+        
+        # Load forwarding group from environment variable
+        env_forwarding_group = os.getenv('FORWARDING_GROUP_ID', '')
+        if env_forwarding_group and not self.forwarding_group_id:
+            try:
+                self.forwarding_group_id = int(env_forwarding_group)
+                # Save to database for persistence
+                self.set_forwarding_group(self.forwarding_group_id)
+                logger.info(f"Set forwarding group from env: {self.forwarding_group_id}")
+            except Exception as e:
+                logger.error(f"Error loading forwarding group from environment: {e}")
+        
+    def save_bot_setting(self, key: str, value: str):
+        """Save a bot setting to database"""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO bot_settings (key, value, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+        ''', (key, value))
+        conn.commit()
         conn.close()
         
     def add_authorized_group(self, group_id: int, group_name: str):
@@ -405,6 +471,8 @@ class FeedbackBot:
     def set_forwarding_group(self, group_id):
         """Set the group ID for feedback forwarding"""
         self.forwarding_group_id = group_id
+        # Save to database for persistence
+        self.save_bot_setting('forwarding_group_id', str(group_id))
     
     def get_forwarding_group(self):
         """Get the current forwarding group ID"""
@@ -994,7 +1062,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 
                 member_name = display_name or username or f"User {user.id}"
-                await update.message.reply_text(f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here @HijiFbDump🦄")
+                await update.message.reply_text(f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here https://t.me/+388LvrCZuK9kZmE9🦄")
                 logger.info(f"Feedback received from {username} ({user.id}) in group {group_id}")
                 
                 # Schedule feedback forwarding after 3-4 seconds
@@ -1042,7 +1110,7 @@ async def handle_reply_to_single_media(update: Update, context: ContextTypes.DEF
     
     # Send confirmation message
     member_name = display_name or username or f"User {user.id}"
-    await update.message.reply_text(f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here @HijiFbDump🦄")
+    await update.message.reply_text(f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here https://t.me/+388LvrCZuK9kZmE9🦄")
     
     logger.info(f"Feedback logged from {username} in {group_name} (reply to single media)")
     
@@ -1120,7 +1188,7 @@ async def handle_reply_to_media_group(update: Update, context: ContextTypes.DEFA
         
         try:
             await update.message.reply_text(
-                f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here @HijiFbDump🦄"
+                f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here https://t.me/+388LvrCZuK9kZmE9🦄"
             )
         except Exception as e:
             logger.error(f"Failed to send confirmation for media group reply: {e}")
@@ -1274,7 +1342,7 @@ async def process_media_group_delayed(context, media_group_id: str):
         try:
             await context.bot.send_message(
                 chat_id=group_id,
-                text=f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here @HijiFbDump🦄"
+                text=f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here https://t.me/+388LvrCZuK9kZmE9🦄"
             )
         except Exception as e:
             logger.error(f"Failed to send confirmation for media group: {e}")
