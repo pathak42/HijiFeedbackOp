@@ -1062,7 +1062,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 
                 member_name = display_name or username or f"User {user.id}"
-                await update.message.reply_text(f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here https://t.me/+388LvrCZuK9kZmE9🦄")
+                await update.message.reply_text(f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here https://t.me/+388LvrCZuK9kZmE9")
                 logger.info(f"Feedback received from {username} ({user.id}) in group {group_id}")
                 
                 # Schedule feedback forwarding after 3-4 seconds
@@ -1110,7 +1110,7 @@ async def handle_reply_to_single_media(update: Update, context: ContextTypes.DEF
     
     # Send confirmation message
     member_name = display_name or username or f"User {user.id}"
-    await update.message.reply_text(f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here https://t.me/+388LvrCZuK9kZmE9🦄")
+    await update.message.reply_text(f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here https://t.me/+388LvrCZuK9kZmE9")
     
     logger.info(f"Feedback logged from {username} in {group_name} (reply to single media)")
     
@@ -1188,7 +1188,7 @@ async def handle_reply_to_media_group(update: Update, context: ContextTypes.DEFA
         
         try:
             await update.message.reply_text(
-                f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here https://t.me/+388LvrCZuK9kZmE9🦄"
+                f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here https://t.me/+388LvrCZuK9kZmE9"
             )
         except Exception as e:
             logger.error(f"Failed to send confirmation for media group reply: {e}")
@@ -1342,7 +1342,7 @@ async def process_media_group_delayed(context, media_group_id: str):
         try:
             await context.bot.send_message(
                 chat_id=group_id,
-                text=f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here https://t.me/+388LvrCZuK9kZmE9🦄"
+                text=f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here https://t.me/+388LvrCZuK9kZmE9"
             )
         except Exception as e:
             logger.error(f"Failed to send confirmation for media group: {e}")
