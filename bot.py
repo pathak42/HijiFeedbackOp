@@ -2,7 +2,9 @@ import os
 import sqlite3
 import logging
 import asyncio
+import io
 from datetime import datetime, timedelta, time as dt_time
+from PIL import Image, ImageDraw
 from typing import Optional, List, Dict
 import threading
 import time
@@ -32,6 +34,12 @@ OWNER_ID = int(os.getenv('OWNER_ID', '0'))
 REMINDER_INTERVAL = int(os.getenv('REMINDER_INTERVAL', '7200'))  # 2 hours in seconds
 PORT = int(os.getenv('PORT', '8080'))
 
+# Temporary group for data extraction (to avoid members seeing unwatermarked images)
+TEMP_EXTRACTION_GROUP = os.getenv('TEMP_EXTRACTION_GROUP', '')  # Optional separate group for temp forwards
+
+# Hardcoded base64 watermark (optional - set this to your base64 encoded PNG)
+HARDCODED_WATERMARK_BASE64 = os.getenv('WATERMARK_BASE64', '')
+
 # Hardcoded admin usernames (always treated as admins)
 HARDCODED_ADMINS = {"GroupAnonymousBot"}
 
@@ -43,7 +51,7 @@ class FeedbackBot:
         self.app = None
         self.authorized_groups = set()
         self.group_reminders = {}
-        self.media_groups = {}  # Track media groups: {media_group_id: {'messages': [], 'has_feedback': False, 'user_id': int, 'group_id': int}}
+        self.media_groups = {}  # Track ALL media groups for 3 hours: {media_group_id: {'messages': [], 'has_feedback': False, 'user_id': int, 'group_id': int, 'created_at': datetime, 'username': str, 'display_name': str}}
         self.forwarding_group_id = None  # Will be loaded from database or env
         self.init_database()
         self.load_authorized_groups()
@@ -132,6 +140,15 @@ class FeedbackBot:
             )
         ''')
         
+        # Watermark storage table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS watermark (
+                id INTEGER PRIMARY KEY,
+                image_data BLOB,
+                uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
         conn.commit()
         conn.close()
         
@@ -198,6 +215,100 @@ class FeedbackBot:
         ''', (key, value))
         conn.commit()
         conn.close()
+        
+    def save_watermark(self, image_data: bytes):
+        """Save watermark image to database"""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        # Delete existing watermark and insert new one
+        cursor.execute('DELETE FROM watermark')
+        cursor.execute('INSERT INTO watermark (image_data) VALUES (?)', (image_data,))
+        conn.commit()
+        conn.close()
+        
+    def get_watermark(self):
+        """Get watermark image from database or hardcoded base64"""
+        # First check for hardcoded watermark
+        if HARDCODED_WATERMARK_BASE64:
+            try:
+                import base64
+                return base64.b64decode(HARDCODED_WATERMARK_BASE64)
+            except Exception as e:
+                logger.error(f"Error decoding hardcoded watermark: {e}")
+        
+        # Fallback to database watermark
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT image_data FROM watermark ORDER BY id DESC LIMIT 1")
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else None
+    
+    def apply_watermark_to_image(self, image_data: bytes, member_name: str) -> Optional[bytes]:
+        """Apply watermark to image with orientation detection"""
+        try:
+            watermark_data = self.get_watermark()
+            if not watermark_data:
+                return None
+                
+            # Open the original image
+            original_img = Image.open(io.BytesIO(image_data))
+            if original_img.mode != 'RGBA':
+                original_img = original_img.convert('RGBA')
+                
+            # Open the watermark
+            watermark = Image.open(io.BytesIO(watermark_data))
+            if watermark.mode != 'RGBA':
+                watermark = watermark.convert('RGBA')
+            
+            # Get dimensions
+            img_width, img_height = original_img.size
+            wm_width, wm_height = watermark.size
+            
+            # Determine orientation and resize watermark accordingly
+            if img_width > img_height:
+                # Horizontal image - resize watermark to 80% of width
+                new_wm_width = int(img_width * 0.8)
+                aspect_ratio = wm_height / wm_width
+                new_wm_height = int(new_wm_width * aspect_ratio)
+                
+                # Position: center horizontally, center vertically
+                x_pos = (img_width - new_wm_width) // 2
+                y_pos = (img_height - new_wm_height) // 2
+            else:
+                # Vertical image - resize watermark to 80% of width (ignore height)
+                new_wm_width = int(img_width * 0.8)
+                aspect_ratio = wm_height / wm_width
+                new_wm_height = int(new_wm_width * aspect_ratio)
+                
+                # Position: center horizontally, center vertically
+                x_pos = (img_width - new_wm_width) // 2
+                y_pos = (img_height - new_wm_height) // 2
+            
+            # Resize watermark
+            watermark_resized = watermark.resize((new_wm_width, new_wm_height), Image.Resampling.LANCZOS)
+            
+            # Create a copy of the original image to avoid modifying it
+            result_img = original_img.copy()
+            
+            # Apply watermark with transparency
+            result_img.paste(watermark_resized, (x_pos, y_pos), watermark_resized)
+            
+            # Convert back to RGB if needed (for JPEG compatibility)
+            if result_img.mode == 'RGBA':
+                # Create white background
+                background = Image.new('RGB', result_img.size, (255, 255, 255))
+                background.paste(result_img, mask=result_img.split()[-1])  # Use alpha channel as mask
+                result_img = background
+            
+            # Save to bytes
+            output = io.BytesIO()
+            result_img.save(output, format='JPEG', quality=100)
+            return output.getvalue()
+            
+        except Exception as e:
+            logger.error(f"Error applying watermark: {e}")
+            return None
         
     def add_authorized_group(self, group_id: int, group_name: str):
         """Add a group to authorized groups"""
@@ -786,7 +897,20 @@ async def check_user_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Check if it's a reply to a message
     if update.message.reply_to_message:
         target_user = update.message.reply_to_message.from_user
-    # Check if there's a mention in the command
+    # Check if there's a mention in the command or arguments
+    elif context.args:
+        # Check for @username in arguments
+        for arg in context.args:
+            if arg.startswith('@'):
+                username = arg[1:]  # Remove @ symbol
+                try:
+                    # Try to get user info by username
+                    chat_member = await context.bot.get_chat_member(group_id, f"@{username}")
+                    target_user = chat_member.user
+                    break
+                except Exception as e:
+                    logger.error(f"Could not find user @{username}: {e}")
+                    continue
     elif update.message.entities:
         for entity in update.message.entities:
             if entity.type == "mention":
@@ -903,6 +1027,81 @@ async def fbcount_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(message, parse_mode='Markdown')
 
+async def addwatermark_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /addwatermark command - Owner only (DM only)"""
+    if update.effective_chat.type != 'private':
+        await update.message.reply_text("❌ This command can only be used in DM.")
+        return
+        
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Only the bot owner can use this command.")
+        return
+    
+    # Set user state to expect watermark file
+    context.user_data['expecting_watermark'] = True
+    await update.message.reply_text("📎 Please send a PNG image file as a document (not as compressed photo).")
+
+async def handle_watermark_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle watermark file upload"""
+    if not context.user_data.get('expecting_watermark'):
+        return False
+    
+    if update.effective_user.id != OWNER_ID:
+        return False
+    
+    document = update.message.document
+    if not document:
+        await update.message.reply_text("❌ Please send a PNG file as a document.")
+        return True
+    
+    # Check if it's a PNG file
+    if not document.file_name or not document.file_name.lower().endswith('.png'):
+        await update.message.reply_text("❌ Please send a PNG file (.png extension required).")
+        return True
+    
+    # Check file size (limit to 10MB)
+    if document.file_size > 10 * 1024 * 1024:
+        await update.message.reply_text("❌ File too large. Please send a PNG file smaller than 10MB.")
+        return True
+    
+    try:
+        # Download the file
+        file = await context.bot.get_file(document.file_id)
+        image_data = await file.download_as_bytearray()
+        
+        # Validate it's a valid PNG image
+        try:
+            img = Image.open(io.BytesIO(image_data))
+            # Convert to RGBA if not already (for transparency support)
+            if img.mode != 'RGBA':
+                img = img.convert('RGBA')
+            
+            # Save back to bytes
+            output = io.BytesIO()
+            img.save(output, format='PNG')
+            image_data = output.getvalue()
+            
+        except Exception as e:
+            await update.message.reply_text(f"❌ Invalid PNG image format. Please send a valid PNG file.")
+            context.user_data['expecting_watermark'] = False
+            return True
+        
+        # Save watermark to database
+        feedback_bot.save_watermark(image_data)
+        
+        # Clear the expecting state
+        context.user_data['expecting_watermark'] = False
+        
+        await update.message.reply_text("✅ Watermark uploaded successfully! It will be applied to all feedback images.")
+        logger.info(f"Watermark uploaded by owner {update.effective_user.id}")
+        
+    except Exception as e:
+        logger.error(f"Error uploading watermark: {e}")
+        await update.message.reply_text("❌ Failed to upload watermark. Please try again.")
+        context.user_data['expecting_watermark'] = False
+    
+    return True
+
 async def fbcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /fbcommands command - Admins only"""
     if update.effective_chat.type == 'private':
@@ -914,21 +1113,12 @@ async def fbcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     
     message = "🤖 **Bot Commands:**\n\n"
-    message += "**For Everyone:**\n"
-    message += "• `/start` - Welcome message\n\n"
-    
-    message += "**For Admins:**\n"
-    message += "• `/fb_stats` - Show feedback from last 3 days\n"
-    message += "• `/check @user` - Check user's feedback (reply or mention)\n"
-    message += "• `/fbcount` - Show feedback statistics\n"
-    message += "• `/fbcommands` - Show this commands list\n"
-    message += "• `/addreminder <text>` - Set periodic reminders\n\n"
-    
-    message += "**For Owner:**\n"
+    message += "**Owner Only (DM):**\n"
     message += "• `/addgroup` - Authorize group (in group or DM with ID)\n"
     message += "• `/removegroup` - Remove group authorization (DM only)\n"
     message += "• `/addauth <user_id>` - Manually authorize user for admin commands\n"
     message += "• `/addplace <group_id>` - Set feedback forwarding group (DM only)\n"
+    message += "• `/addwatermark` - Upload watermark image for feedback (DM only)\n"
     message += "• `/logs` - Download bot log file (DM only)\n"
     message += "• `/addreminder` - Set reminders (in group or DM with ID)\n"
     message += "• `/cleardb` - Clear all feedback data\n\n"
@@ -941,7 +1131,10 @@ async def fbcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle regular messages to detect feedback"""
+    # Check if this is a watermark upload in private chat
     if update.effective_chat.type == 'private':
+        if await handle_watermark_upload(update, context):
+            return
         return
         
     group_id = update.effective_chat.id
@@ -965,8 +1158,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     # Only process if:
     # 1. Message has media with #feedback, OR
-    # 2. Reply to media with #feedback from the SAME user who sent the media, OR
-    # 3. Message with media replying to anything (to handle media reply with #feedback)
+    # 2. Reply to media with #feedback from the SAME user who sent the media
+    # Note: When replying with media to text, we want to process the media message, not the text
     if not (has_media or (is_reply_to_media and reply_from_same_user)):
         return
         
@@ -982,109 +1175,145 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Check if any message in the media group has #feedback
         has_feedback = '#feedback' in text.lower()
         
-        # Initialize media group tracking if not exists
+        # Initialize media group tracking if not exists (track ALL media groups for 3 hours)
         if media_group_id not in feedback_bot.media_groups:
             feedback_bot.media_groups[media_group_id] = {
                 'messages': [],
                 'has_feedback': has_feedback,
                 'user_id': user.id,
-                'username': username or '',
-                'display_name': display_name or f"User {user.id}",
+                'username': username,
+                'display_name': display_name,
                 'group_id': group_id,
                 'group_name': group_name,
-                'media_group_id': media_group_id,  # Store for cleanup
-                'processing_scheduled': False  # Flag to track if processing is already scheduled
+                'media_group_id': media_group_id,
+                'processed': False,
+                'created_at': datetime.now()  # Track creation time for 3-hour cleanup
             }
-        else:
-            # Update has_feedback if this message has the tag
-            if has_feedback:
-                feedback_bot.media_groups[media_group_id]['has_feedback'] = True
         
-        # Add this message to the media group if not already added
-        message_exists = any(msg.get('message_id') == message.message_id for msg in feedback_bot.media_groups[media_group_id]['messages'])
-        if not message_exists:
-            feedback_bot.media_groups[media_group_id]['messages'].append({
-                'message_id': message.message_id,
-                'text': text,
-                'has_media': has_media
-            })
+        # Add this message to the media group with more details
+        feedback_bot.media_groups[media_group_id]['messages'].append({
+            'message_id': message.message_id,
+            'text': text,
+            'has_media': has_media,
+            'photo': bool(message.photo),
+            'video': bool(message.video),
+            'document': bool(message.document),
+            'animation': bool(message.animation)
+        })
         
-        # Schedule processing of media group after a delay (to collect all messages)
-        # Only schedule if not already scheduled and if we have feedback
-        media_group = feedback_bot.media_groups[media_group_id]
-        if not media_group.get('processing_scheduled', False) and media_group['has_feedback']:
-            media_group['processing_scheduled'] = True
+        # Update feedback flag if this message has #feedback
+        if has_feedback:
+            feedback_bot.media_groups[media_group_id]['has_feedback'] = True
+        
+        # Schedule delayed processing (only once per media group)
+        if not feedback_bot.media_groups[media_group_id].get('scheduled', False):
+            feedback_bot.media_groups[media_group_id]['scheduled'] = True
             context.job_queue.run_once(
-                lambda ctx, mg_id=media_group_id: process_media_group_delayed(ctx, mg_id),
-                when=2.0  # 2 seconds delay
+                lambda ctx: process_media_group_delayed(ctx, media_group_id),
+                when=10.0  # 10 seconds delay to collect all messages (increased for large groups)
             )
-        elif not media_group['has_feedback']:
-            # If no feedback tag found, clean up after a while
-            async def cleanup_media_group(context, mg_id):
-                if mg_id in feedback_bot.media_groups:
-                    del feedback_bot.media_groups[mg_id]
+        
+        # Schedule 3-hour cleanup for this media group (only once per group)
+        if not feedback_bot.media_groups[media_group_id].get('cleanup_scheduled', False):
+            feedback_bot.media_groups[media_group_id]['cleanup_scheduled'] = True
+            context.job_queue.run_once(
+                lambda ctx: cleanup_media_group(ctx, media_group_id),
+                when=10800  # 3 hours = 10800 seconds
+            )
+    
+    # Handle non-media group messages with #feedback
+    elif '#feedback' in text.lower():
+        if message.reply_to_message:
+            # Reply with #feedback to another message
+            reply_msg = message.reply_to_message
             
-            context.job_queue.run_once(
-                lambda ctx, mg_id=media_group_id: cleanup_media_group(ctx, mg_id),
-                when=10800.0  # 3 hours (10800 seconds) delay before cleanup
-            )
-        
-    else:
-        # Handle single media message or reply to media
-        if '#feedback' in text.lower():
-            # Handle reply to media (from same user only)
-            if is_reply_to_media and reply_from_same_user:
-                # Handle reply to media (possibly media group)
-                reply_msg = message.reply_to_message
+            # Check if replying user is the same as original media sender
+            if reply_msg.from_user.id != user.id:
+                logger.info(f"User {user.id} tried to reply with #feedback to message from {reply_msg.from_user.id} - ignoring")
+                return
+            
+            if reply_msg.media_group_id:
+                # Reply to media group - use stored data directly
+                media_group_id = reply_msg.media_group_id
+                media_group_data = feedback_bot.media_groups.get(media_group_id)
                 
-                if reply_msg.media_group_id:
-                    # Reply to media group - need to count all items in that group
+                if media_group_data:
+                    # Use stored media group data - no reconstruction needed
+                    logger.info(f"Found stored media group {media_group_id} with {len(media_group_data['messages'])} messages")
+                    # Check if already forwarded to prevent duplicate forwarding
+                    if media_group_data.get('forwarded', False):
+                        logger.info(f"Media group {media_group_id} already forwarded, resetting flag for new reply")
+                        media_group_data['forwarded'] = False
                     await handle_reply_to_media_group(update, context, reply_msg)
                 else:
-                    # Reply to single media
+                    # Fallback to single message if media group data not found
+                    logger.warning(f"Media group {media_group_id} not in storage, treating as single media")
                     await handle_reply_to_single_media(update, context, reply_msg)
+            elif is_reply_to_media:
+                # Reply to single media - forward the replied media
+                await handle_reply_to_single_media(update, context, reply_msg)
+            else:
+                # Reply with #feedback to text message - this should not forward the text
+                # Instead, if the reply message has media, process the reply message itself
+                if has_media:
+                    # User replied to text with media containing #feedback
+                    # Process the media message (current message), not the text being replied to
+                    logger.info(f"User replied to text with media containing #feedback - processing the media message")
+                    
+                    # Create message link for the media message
+                    if update.effective_chat.username:
+                        message_link = f"https://t.me/{update.effective_chat.username}/{message.message_id}"
+                    else:
+                        message_link = f"https://t.me/c/{str(group_id)[4:]}/{message.message_id}"
+                    
+                    feedback_bot.add_feedback(
+                        user.id, username, display_name, group_id, 
+                        group_name, message_link, message.message_id, 1
+                    )
+                    
+                    # Add to daily contest (single item)
+                    feedback_bot.add_contest_feedback(
+                        user.id, username, display_name, group_id, 1
+                    )
+                    
+                    member_name = display_name or username or f"User {user.id}"
+                    await update.message.reply_text(f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here https://t.me/+388LvrCZuK9kZmE9")
+                    logger.info(f"Feedback received from {username} ({user.id}) in group {group_id} (media reply to text)")
+                    
+                    # Schedule feedback forwarding for the media message (not the text)
+                    context.job_queue.run_once(
+                        lambda ctx: forward_feedback_delayed(ctx, message, user, group_name),
+                        when=3.5  # 3.5 seconds delay
+                    )
+                    return
+        
+        elif has_media:
+            # Direct media with #feedback (including media replies to text/other messages)
+            # Create message link
+            if update.effective_chat.username:
+                message_link = f"https://t.me/{update.effective_chat.username}/{message.message_id}"
+            else:
+                message_link = f"https://t.me/c/{str(group_id)[4:]}/{message.message_id}"
             
-            elif has_media:
-                # Direct media with #feedback (including media replies to text/other messages)
-                # Create message link
-                if update.effective_chat.username:
-                    message_link = f"https://t.me/{update.effective_chat.username}/{message.message_id}"
-                else:
-                    message_link = f"https://t.me/c/{str(group_id)[4:]}/{message.message_id}"
-                
-                feedback_bot.add_feedback(
-                    user.id, username, display_name, group_id, 
-                    group_name, message_link, message.message_id, 1
-                )
-                
-                # Add to daily contest (single item)
-                feedback_bot.add_contest_feedback(
-                    user.id, username, display_name, group_id, 1
-                )
-                
-                member_name = display_name or username or f"User {user.id}"
-                await update.message.reply_text(f"✅ Feedback received! Thank you Group,\nCheck ur feedbacks here https://t.me/+388LvrCZuK9kZmE9")
-                logger.info(f"Feedback received from {username} ({user.id}) in group {group_id}")
-                
-                # Schedule feedback forwarding after 3-4 seconds
-                # Forward the current message (which has the media), not the replied-to message
-                context.job_queue.run_once(
-                    lambda context: forward_feedback_delayed(context, message, user, group_name),
-                    when=3.5  # 3.5 seconds delay
-                )
-                
-                logger.info(f"Feedback logged from {username} in {group_name} (single media)")
-                
-                # Add to daily contest (reply to media)
-                feedback_bot.add_contest_feedback(
-                    user.id, username, display_name, group_id, 1
-                )
-                
-                # Schedule feedback forwarding after 3-4 seconds
-                context.job_queue.run_once(
-                    lambda ctx: forward_feedback_delayed(ctx, reply_msg, user, group_name),
-                    when=3.5  # 3.5 seconds delay
-                )
+            feedback_bot.add_feedback(
+                user.id, username, display_name, group_id, 
+                group_name, message_link, message.message_id, 1
+            )
+            
+            # Add to daily contest (single item)
+            feedback_bot.add_contest_feedback(
+                user.id, username, display_name, group_id, 1
+            )
+            
+            member_name = display_name or username or f"User {user.id}"
+            await update.message.reply_text(f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here https://t.me/+388LvrCZuK9kZmE9")
+            logger.info(f"Feedback received from {username} ({user.id}) in group {group_id}")
+            
+            # Schedule feedback forwarding after 3-4 seconds
+            context.job_queue.run_once(
+                lambda ctx: forward_feedback_delayed(ctx, message, user, group_name),
+                when=3.5  # 3.5 seconds delay
+            )
 
 async def handle_reply_to_single_media(update: Update, context: ContextTypes.DEFAULT_TYPE, reply_msg):
     """Handle #feedback reply to a single media message"""
@@ -1112,7 +1341,7 @@ async def handle_reply_to_single_media(update: Update, context: ContextTypes.DEF
     
     # Send confirmation message
     member_name = display_name or username or f"User {user.id}"
-    await update.message.reply_text(f"✅ Feedback received! Thank you Group,\nCheck ur feedbacks here https://t.me/+388LvrCZuK9kZmE9")
+    await update.message.reply_text(f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here https://t.me/+388LvrCZuK9kZmE9")
     
     logger.info(f"Feedback logged from {username} in {group_name} (reply to single media)")
     
@@ -1123,7 +1352,7 @@ async def handle_reply_to_single_media(update: Update, context: ContextTypes.DEF
     )
 
 async def handle_reply_to_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE, reply_msg):
-    """Handle #feedback reply to a media group - forward entire group and count all items"""
+    """Handle #feedback reply to a media group - use stored data, no reconstruction needed"""
     try:
         # Get the media group ID from the replied message
         if not hasattr(reply_msg, 'media_group_id') or not reply_msg.media_group_id:
@@ -1136,12 +1365,11 @@ async def handle_reply_to_media_group(update: Update, context: ContextTypes.DEFA
         username = user.username or user.full_name or f"User {user.id}"
         group_name = update.effective_chat.title or "Unknown Group"
         
-        # Get the media group data if it exists
+        # Get the media group data from our 3-hour storage
         media_group_data = feedback_bot.media_groups.get(media_group_id)
         if not media_group_data:
-            logger.warning(f"No media group data found for ID: {media_group_id}")
-            # Try to find the media group by searching recent messages
-            await find_and_process_media_group(update, context, media_group_id, reply_msg.message_id)
+            logger.error(f"Media group {media_group_id} not found in storage - may have been cleaned up")
+            await update.message.reply_text("❌ Media group data not found. Please try again or send feedback directly with media.")
             return
             
         # Since this is a reply with #feedback, we should process the media group
@@ -1149,6 +1377,8 @@ async def handle_reply_to_media_group(update: Update, context: ContextTypes.DEFA
             
         # Count all media in the group
         media_count = len(media_group_data['messages'])
+        
+        logger.info(f"Processing media group reply: {media_count} messages to forward")
         
         # Add feedback for each message in the group
         # Use the original media sender's info (since only they can reply with feedback)
@@ -1185,16 +1415,18 @@ async def handle_reply_to_media_group(update: Update, context: ContextTypes.DEFA
         # Mark that this media group has been processed for feedback
         media_group_data['has_feedback'] = True
         
-        # Send confirmation message
-        member_name = media_group_data['display_name'] or media_group_data['username'] or f"User {media_group_data['user_id']}"
-        
-        try:
-            await update.message.reply_text(
-                f"✅ Feedback received! Thank you Group,\nCheck ur feedbacks here https://t.me/+388LvrCZuK9kZmE9"
-            )
-        except Exception as e:
-            logger.error(f"Failed to send confirmation for media group reply: {e}")
+        # Send confirmation message only once per media group
+        if not media_group_data.get('confirmation_sent', False):
+            member_name = media_group_data['display_name'] or media_group_data['username'] or f"User {media_group_data['user_id']}"
             
+            try:
+                await update.message.reply_text(
+                    f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here https://t.me/+388LvrCZuK9kZmE9"
+                )
+                media_group_data['confirmation_sent'] = True
+            except Exception as e:
+                logger.error(f"Failed to send confirmation for media group reply: {e}")
+                
         logger.info(f"Media group feedback logged from {media_group_data['username']} in {group_name} (count: {media_count})")
         
         # Schedule feedback forwarding for media group after a short delay
@@ -1279,7 +1511,7 @@ async def find_and_process_media_group(update: Update, context: ContextTypes.DEF
         # Send confirmation message
         try:
             await update.message.reply_text(
-                f"✅ Feedback received! Thank you Group,\nCheck ur feedbacks here https://t.me/+388LvrCZuK9kZmE9"
+                f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here https://t.me/+388LvrCZuK9kZmE9"
             )
         except Exception as e:
             logger.error(f"Failed to send confirmation: {e}")
@@ -1317,9 +1549,9 @@ async def process_media_group_delayed(context, media_group_id: str):
     try:
         # Process the media group
         media_count = len(media_group_data['messages'])
-        first_message = media_group_data['messages'][0] if media_count > 0 else None
+        logger.info(f"Processing media group {media_group_id} with {media_count} messages collected")
         
-        if not first_message:
+        if media_count == 0:
             logger.warning(f"No messages found in media group {media_group_id}")
             return
         
@@ -1362,7 +1594,7 @@ async def process_media_group_delayed(context, media_group_id: str):
         try:
             await context.bot.send_message(
                 chat_id=group_id,
-                text=f"✅ Feedback received! Thank you Group,\nCheck ur feedbacks here https://t.me/+388LvrCZuK9kZmE9"
+                text=f"✅ Feedback received! Thank you {member_name},\nCheck ur feedbacks here https://t.me/+388LvrCZuK9kZmE9"
             )
         except Exception as e:
             logger.error(f"Failed to send confirmation for media group: {e}")
@@ -1373,32 +1605,73 @@ async def process_media_group_delayed(context, media_group_id: str):
         if media_count > 0:
             context.job_queue.run_once(
                 lambda ctx, mgd=media_group_data, mc=media_count: forward_media_group_delayed(ctx, mgd, mc),
-                when=1.5  # 1.5 seconds delay before forwarding
+                when=2.0  # 2 seconds delay before forwarding
             )
     except Exception as e:
         logger.error(f"Error processing media group {media_group_id}: {e}")
     finally:
-        # Clean up media group data after processing
-        if media_group_id in feedback_bot.media_groups:
-            del feedback_bot.media_groups[media_group_id]
+        # Don't clean up media group data immediately - keep for 3 hours for reply functionality
+        pass
 
 async def forward_feedback_delayed(context, message, user, group_name):
-    """Forward single feedback to the designated group after delay"""
+    """Forward single feedback to the designated group after delay with watermarking for images"""
     forwarding_group_id = feedback_bot.get_forwarding_group()
     if not forwarding_group_id:
         return
         
     try:
         username = user.username or user.full_name or f"User {user.id}"
+        member_name = user.full_name or user.username or f"User {user.id}"
         
-        # Forward the original message only
-        await context.bot.forward_message(
-            chat_id=forwarding_group_id,
-            from_chat_id=message.chat_id,
-            message_id=message.message_id
-        )
-        
-        logger.info(f"Feedback forwarded to group {forwarding_group_id} from {username}")
+        # Check if message has photo (image)
+        if message.photo:
+            try:
+                # Get the largest photo size
+                photo = message.photo[-1]
+                file = await context.bot.get_file(photo.file_id)
+                image_data = await file.download_as_bytearray()
+                
+                # Apply watermark
+                watermarked_data = feedback_bot.apply_watermark_to_image(bytes(image_data), member_name)
+                
+                if watermarked_data:
+                    # Send watermarked image with modified caption
+                    original_caption = message.caption or ""
+                    new_caption = f"{original_caption} By {member_name}".strip()
+                    
+                    await context.bot.send_photo(
+                        chat_id=forwarding_group_id,
+                        photo=io.BytesIO(watermarked_data),
+                        caption=new_caption
+                    )
+                    
+                    # Delete original message from source group
+                    try:
+                        await context.bot.delete_message(
+                            chat_id=message.chat_id,
+                            message_id=message.message_id
+                        )
+                        logger.info(f"Deleted original feedback image from source group")
+                    except Exception as e:
+                        logger.error(f"Failed to delete original message: {e}")
+                    
+                    logger.info(f"Watermarked feedback image sent to group {forwarding_group_id} from {username}")
+                else:
+                    # No fallback - if watermarking fails, don't forward the image
+                    logger.warning(f"Watermarking failed for {username}, image not forwarded")
+                    
+            except Exception as e:
+                logger.error(f"Error processing image watermark: {e}")
+                # No fallback - if watermarking process fails, don't forward the image
+                logger.warning(f"Image processing failed for {username}, image not forwarded")
+        else:
+            # For videos, documents, and other media - use normal forwarding
+            await context.bot.forward_message(
+                chat_id=forwarding_group_id,
+                from_chat_id=message.chat_id,
+                message_id=message.message_id
+            )
+            logger.info(f"Non-image feedback forwarded normally to group {forwarding_group_id} from {username}")
         
     except Exception as e:
         logger.error(f"Error forwarding feedback: {e}")
@@ -1417,6 +1690,8 @@ async def forward_media_group_delayed(context, media_group_data, media_count):
     # Mark as forwarded to prevent duplicate forwarding
     media_group_data['forwarded'] = True
     
+    logger.info(f"Processing media group with {len(media_group_data['messages'])} messages for forwarding")
+    
     try:
         group_id = media_group_data['group_id']
         user_id = media_group_data['user_id']
@@ -1426,39 +1701,101 @@ async def forward_media_group_delayed(context, media_group_data, media_count):
         # Sort messages by message_id to maintain original order
         messages = sorted(media_group_data['messages'], key=lambda x: x['message_id'])
         
-        # Forward each message in the media group
+        # Process each message in the media group with watermarking for images
+        member_name = display_name or username or f"User {user_id}"
+        messages_to_delete = []
+        
         for msg_data in messages:
             try:
-                await context.bot.forward_message(
-                    chat_id=forwarding_group_id,
-                    from_chat_id=group_id,
-                    message_id=msg_data['message_id']
-                )
-                # Small delay between forwards to avoid rate limiting
-                await asyncio.sleep(0.5)
+                
+                # Try to get message info using separate temp group or owner's private chat
+                try:
+                    # Use separate temp group if available, otherwise use owner's private chat
+                    temp_chat_id = int(TEMP_EXTRACTION_GROUP) if TEMP_EXTRACTION_GROUP else OWNER_ID
+                    
+                    # Forward to temp location to get message data
+                    original_msg = await context.bot.forward_message(
+                        chat_id=temp_chat_id,
+                        from_chat_id=group_id,
+                        message_id=msg_data['message_id']
+                    )
+                    
+                    # Process based on message type
+                    logger.info(f"Processing message {msg_data['message_id']} - photo: {bool(original_msg.photo)}, video: {bool(original_msg.video)}")
+                    if original_msg.photo:
+                        # Delete the temp forwarded message immediately
+                        await context.bot.delete_message(
+                            chat_id=temp_chat_id,
+                            message_id=original_msg.message_id
+                        )
+                        
+                        # Get image data and apply watermark
+                        photo = original_msg.photo[-1]
+                        file = await context.bot.get_file(photo.file_id)
+                        image_data = await file.download_as_bytearray()
+                        
+                        watermarked_data = feedback_bot.apply_watermark_to_image(bytes(image_data), member_name)
+                        
+                        if watermarked_data:
+                            # Send watermarked image with modified caption
+                            original_caption = original_msg.caption or ""
+                            new_caption = f"{original_caption} By {member_name}".strip()
+                            
+                            await context.bot.send_photo(
+                                chat_id=forwarding_group_id,
+                                photo=io.BytesIO(watermarked_data),
+                                caption=new_caption
+                            )
+                            
+                            # Mark for deletion from source
+                            messages_to_delete.append(msg_data['message_id'])
+                            logger.info(f"Sent watermarked image for message {msg_data['message_id']}")
+                        else:
+                            # Watermarking failed, don't forward the image
+                            logger.warning(f"Watermarking failed for message {msg_data['message_id']}, image not forwarded")
+                    else:
+                        # For videos and other media, delete temp forward and forward to actual destination
+                        await context.bot.delete_message(
+                            chat_id=temp_chat_id,
+                            message_id=original_msg.message_id
+                        )
+                        
+                        # Forward video/media to actual destination
+                        await context.bot.forward_message(
+                            chat_id=forwarding_group_id,
+                            from_chat_id=group_id,
+                            message_id=msg_data['message_id']
+                        )
+                        logger.info(f"Non-image media forwarded for message {msg_data['message_id']}")
+                    
+                except Exception as e:
+                    logger.error(f"Error processing message {msg_data['message_id']}: {e}")
+                    # Don't forward anything if processing fails
+                
+                await asyncio.sleep(1.0)  # Increased rate limiting for large groups
+                
             except Exception as e:
-                logger.error(f"Error forwarding message {msg_data['message_id']} from media group: {e}")
+                logger.error(f"Error processing message {msg_data['message_id']} from media group: {e}")
         
-        logger.info(f"Media group feedback forwarded to group {forwarding_group_id} from {username}")
+        # Delete original image messages from source group
+        for message_id in messages_to_delete:
+            try:
+                await context.bot.delete_message(
+                    chat_id=group_id,
+                    message_id=message_id
+                )
+                logger.info(f"Deleted original image {message_id} from source group")
+            except Exception as e:
+                logger.error(f"Failed to delete original message {message_id}: {e}")
         
-        # Send a summary message
-        try:
-            member_name = display_name or username or f"User {user_id}"
-            await context.bot.send_message(
-                chat_id=forwarding_group_id,
-                text=f"📨 Forwarded media group feedback from {member_name} ({media_count} items)"
-            )
-        except Exception as e:
-            logger.error(f"Error sending summary message: {e}")
+        logger.info(f"Media group feedback processed and sent to group {forwarding_group_id} from {username}")
         
     except Exception as e:
         logger.error(f"Error in forward_media_group_delayed: {e}")
     finally:
-        # Clean up the media group data after forwarding is complete
-        if 'media_group_id' in media_group_data:
-            media_group_id = media_group_data.get('media_group_id')
-            if media_group_id and media_group_id in feedback_bot.media_groups:
-                del feedback_bot.media_groups[media_group_id]
+        # Don't clean up media group data immediately after forwarding
+        # Keep it for 3 hours as designed for future #feedback replies
+        pass
 
 def create_flask_app():
     """Create Flask app for keep-alive"""
@@ -1485,6 +1822,15 @@ async def cleanup_job(context):
         feedback_bot.cleanup_old_feedback()
     except Exception as e:
         logger.error(f"Error in cleanup job: {e}")
+
+async def cleanup_media_group(context, media_group_id: str):
+    """Clean up media group data after 3 hours"""
+    try:
+        if media_group_id in feedback_bot.media_groups:
+            logger.info(f"Cleaning up media group {media_group_id} after 3 hours")
+            del feedback_bot.media_groups[media_group_id]
+    except Exception as e:
+        logger.error(f"Error cleaning up media group {media_group_id}: {e}")
 
 async def reminder_job(context):
     """Reminder job for sending periodic reminders"""
@@ -1566,12 +1912,13 @@ def main():
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Add handlers
+    # Register handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("addgroup", addgroup_command))
     application.add_handler(CommandHandler("removegroup", removegroup_command))
     application.add_handler(CommandHandler("addauth", addauth_command))
     application.add_handler(CommandHandler("addplace", addplace_command))
+    application.add_handler(CommandHandler("addwatermark", addwatermark_command))
     application.add_handler(CommandHandler("logs", logs_command))
     application.add_handler(CommandHandler("fb_stats", fb_stats_command))
     application.add_handler(CommandHandler("check", check_user_feedback))
@@ -1579,7 +1926,7 @@ def main():
     application.add_handler(CommandHandler("addreminder", addreminder_command))
     application.add_handler(CommandHandler("fbcount", fbcount_command))
     application.add_handler(CommandHandler("fbcommands", fbcommands_command))
-    application.add_handler(MessageHandler(filters.ALL, handle_message))
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
     
     # Add job queue for background tasks (if available)
     job_queue = application.job_queue
