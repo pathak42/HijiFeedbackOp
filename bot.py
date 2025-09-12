@@ -1912,6 +1912,12 @@ def main():
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
     
+    # Initialize feedback bot and load persistent data
+    global feedback_bot
+    feedback_bot.load_authorized_groups()
+    feedback_bot.load_bot_settings()
+    logger.info("Loaded persistent data from database")
+    
     # Register handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("addgroup", addgroup_command))
